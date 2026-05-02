@@ -1,0 +1,46 @@
+services:
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   container_name: ollama
+  #   dns:
+  #     - 8.8.8.8
+  #     - 1.1.1.1
+  #   networks:
+  #     - signal-network
+  #   volumes:
+  #     - "./ollama_data:/root/.ollama"
+  #   restart: unless-stopped
+
+  signal-api:
+    image: bbernhard/signal-cli-rest-api:latest
+    container_name: signal-api
+    networks:
+      - signal-network
+    environment:
+      - MODE=normal #supported modes: json-rpc, native, normal
+      #- AUTO_RECEIVE_SCHEDULE=0 22 * * * #enable this parameter on demand
+    volumes:
+      - "./signal-cli-config:/home/.local/share/signal-cli"
+    restart: unless-stopped
+
+  email-bridge:
+    build: .
+    container_name: email-bridge
+    networks:
+      - signal-network
+    depends_on:
+      - signal-api
+    environment:
+      - EMAIL_USER=${EMAIL_USER}
+      - EMAIL_PASS=${EMAIL_PASS}
+      - SIGNAL_SENDER=${SIGNAL_SENDER}
+      - SIGNAL_GROUP_ID=${SIGNAL_GROUP_ID}
+      - OLLAMA_HOST=ollama
+      - OLLAMA_PORT=11434
+      - OLLAMA_MODEL=gemma4:e2b
+    restart: on-failure
+
+
+networks:
+  signal-network:
+    driver: bridge
