@@ -1,15 +1,29 @@
 services:
-  # ollama:
-  #   image: ollama/ollama:latest
-  #   container_name: ollama
-  #   dns:
-  #     - 8.8.8.8
-  #     - 1.1.1.1
-  #   networks:
-  #     - signal-network
-  #   volumes:
-  #     - "./ollama_data:/root/.ollama"
-  #   restart: unless-stopped
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    networks:
+      - signal-network
+    volumes:
+      - "./ollama_data:/root/.ollama"
+    # NOTE: after `docker compose up -d`, run once to pull the model:
+    #   docker exec -it ollama ollama pull gemma4:e2b
+    restart: unless-stopped
+
+  whisper:
+    image: onerahmet/openai-whisper-asr-webservice:latest
+    container_name: whisper
+    networks:
+      - signal-network
+    environment:
+      - ASR_MODEL=base
+      - ASR_ENGINE=faster_whisper
+    volumes:
+      - "./whisper_cache:/root/.cache"
+    restart: unless-stopped
 
   signal-api:
     image: bbernhard/signal-cli-rest-api:latest
@@ -30,16 +44,21 @@ services:
       - signal-network
     depends_on:
       - signal-api
+      - ollama
+      - whisper
     environment:
       - EMAIL_USER=${EMAIL_USER}
       - EMAIL_PASS=${EMAIL_PASS}
       - SIGNAL_SENDER=${SIGNAL_SENDER}
       - SIGNAL_GROUP_ID=${SIGNAL_GROUP_ID}
-      - OLLAMA_HOST=ollama
-      - OLLAMA_PORT=11434
-      - OLLAMA_MODEL=gemma4:e2b
+      - SIGNAL_API_BASE=http://signal-api:8080
+      - WHISPER_URL=http://whisper:9000
+      - WHISPER_LANG=${WHISPER_LANG:-it}
+      - OLLAMA_URL=http://ollama:11434
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-gemma4:e2b}
+      - EMAIL_POLL_INTERVAL=${EMAIL_POLL_INTERVAL:-180}
+      - SIGNAL_POLL_INTERVAL=${SIGNAL_POLL_INTERVAL:-10}
     restart: on-failure
-
 
 networks:
   signal-network:

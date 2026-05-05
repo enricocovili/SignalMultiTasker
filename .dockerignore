@@ -1,0 +1,26 @@
+# Volume-mount data dirs (owned by container users; not part of the image)
+ollama_data/
+whisper_cache/
+signal-cli-config/
+
+# Local dev / VCS
+.git/
+.gitignore
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment & secrets
+.env
+.env.*
+
+# Test fixtures
+test.aac
+test.wav
+
+# Editor / tooling
+.claude/
+.claudeignore
+.vscode/
+.idea/
