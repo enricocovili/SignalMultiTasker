@@ -1,7 +1,7 @@
 # Volume-mount data dirs (owned by container users; not part of the image)
 ollama_data/
-whisper_cache/
 signal-cli-config/
+bridge_state/
 
 # Local dev / VCS
 .git/
@@ -14,10 +14,6 @@ __pycache__/
 # Environment & secrets
 .env
 .env.*
-
-# Test fixtures
-test.aac
-test.wav
 
 # Editor / tooling
 .claude/

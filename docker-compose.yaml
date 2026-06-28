@@ -13,18 +13,6 @@ services:
     #   docker exec -it ollama ollama pull gemma4:e2b
     restart: unless-stopped
 
-  whisper:
-    image: onerahmet/openai-whisper-asr-webservice:latest
-    container_name: whisper
-    networks:
-      - signal-network
-    environment:
-      - ASR_MODEL=base
-      - ASR_ENGINE=faster_whisper
-    volumes:
-      - "./whisper_cache:/root/.cache"
-    restart: unless-stopped
-
   signal-api:
     image: bbernhard/signal-cli-rest-api:latest
     container_name: signal-api
@@ -45,19 +33,19 @@ services:
     depends_on:
       - signal-api
       - ollama
-      - whisper
     environment:
       - EMAIL_USER=${EMAIL_USER}
       - EMAIL_PASS=${EMAIL_PASS}
       - SIGNAL_SENDER=${SIGNAL_SENDER}
       - SIGNAL_GROUP_ID=${SIGNAL_GROUP_ID}
       - SIGNAL_API_BASE=http://signal-api:8080
-      - WHISPER_URL=http://whisper:9000
-      - WHISPER_LANG=${WHISPER_LANG:-it}
       - OLLAMA_URL=http://ollama:11434
       - OLLAMA_MODEL=${OLLAMA_MODEL:-gemma4:e2b}
       - EMAIL_POLL_INTERVAL=${EMAIL_POLL_INTERVAL:-180}
-      - SIGNAL_POLL_INTERVAL=${SIGNAL_POLL_INTERVAL:-10}
+      - MAX_NEW_EMAILS=${MAX_NEW_EMAILS:-10}
+      - STATE_FILE=/app/state/email_state.json
+    volumes:
+      - "./bridge_state:/app/state"
     restart: on-failure
 
 networks:
