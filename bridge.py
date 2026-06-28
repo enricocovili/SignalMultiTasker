@@ -16,6 +16,12 @@ SIGNAL_API_URL = os.getenv("SIGNAL_API_URL", f"{SIGNAL_API_BASE}/v2/send")
 SIGNAL_SENDER = os.getenv("SIGNAL_SENDER")
 SIGNAL_GROUP_ID = os.getenv("SIGNAL_GROUP_ID")
 
+# Device name shown in the linked-devices list of the main Signal account, and
+# where the linking QR (a PNG) is written for the user to scan on first start.
+SIGNAL_DEVICE_NAME = os.getenv("SIGNAL_DEVICE_NAME", "signal-multitasker")
+SIGNAL_LINK_QR_PATH = os.getenv("SIGNAL_LINK_QR_PATH", "/app/state/signal-link-qr.png")
+SIGNAL_AUTH_POLL_INTERVAL = int(os.getenv("SIGNAL_AUTH_POLL_INTERVAL", "5"))
+
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:e2b")
 
@@ -90,6 +96,73 @@ def get_llm_summary(text, prompt_template=EMAIL_LLM_PROMPT):
     except Exception as e:
         print(f"⚠️ Error generating summary: {e}")
         return None
+
+
+# ── Signal auth ───────────────────────────────────────────────────────────────
+def signal_registered_numbers():
+    """Return the list of accounts registered/linked in signal-api."""
+    r = requests.get(f"{SIGNAL_API_BASE}/v1/accounts", timeout=SIGNAL_TIMEOUT)
+    r.raise_for_status()
+    return r.json() or []
+
+
+def fetch_link_qr():
+    """Generate a device-link QR (PNG) and write it to the state volume.
+
+    Each call creates a fresh linking URI, so call it once per link attempt.
+    """
+    r = requests.get(
+        f"{SIGNAL_API_BASE}/v1/qrcodelink",
+        params={"device_name": SIGNAL_DEVICE_NAME},
+        timeout=SIGNAL_TIMEOUT,
+    )
+    r.raise_for_status()
+    os.makedirs(os.path.dirname(SIGNAL_LINK_QR_PATH), exist_ok=True)
+    with open(SIGNAL_LINK_QR_PATH, "wb") as f:
+        f.write(r.content)
+    return SIGNAL_LINK_QR_PATH
+
+
+def ensure_signal_account():
+    """Block until SIGNAL_SENDER is linked with signal-api.
+
+    On first start the account is not yet linked: we emit a QR (saved on the
+    state volume) for the user to scan from their main phone
+    (Signal → Settings → Linked devices → Link new device), then poll until the
+    link completes. If already linked, returns immediately.
+    """
+    # signal-api may not be reachable yet (compose only waits for start, not
+    # readiness) — retry the first lookup until it answers.
+    while True:
+        try:
+            numbers = signal_registered_numbers()
+            break
+        except Exception as e:
+            print(f"⏳ Waiting for signal-api to come up: {e}")
+            time.sleep(SIGNAL_AUTH_POLL_INTERVAL)
+
+    if SIGNAL_SENDER in numbers:
+        print(f"✅ Signal account {SIGNAL_SENDER} already linked.")
+        return
+
+    print(f"🔑 Signal account {SIGNAL_SENDER} is not linked yet.")
+    try:
+        path = fetch_link_qr()
+        print(
+            f"📲 Scan the QR at {path} from your phone "
+            "(Signal → Settings → Linked devices → Link new device) to link this bridge."
+        )
+    except Exception as e:
+        print(f"⚠️ Could not generate the link QR: {e}")
+
+    while True:
+        time.sleep(SIGNAL_AUTH_POLL_INTERVAL)
+        try:
+            if SIGNAL_SENDER in signal_registered_numbers():
+                print(f"✅ Signal account {SIGNAL_SENDER} linked successfully.")
+                return
+        except Exception as e:
+            print(f"⚠️ Re-checking signal-api: {e}")
 
 
 # ── Signal helpers ────────────────────────────────────────────────────────────
@@ -170,7 +243,9 @@ def listen_for_emails():
 
             # All UIDs currently in the inbox.
             _, search_data = mail.uid("search", None, "ALL")
-            all_uids = [int(x) for x in search_data[0].split()] if search_data[0] else []
+            all_uids = (
+                [int(x) for x in search_data[0].split()] if search_data[0] else []
+            )
             max_uid = max(all_uids) if all_uids else 0
 
             state = load_state()
@@ -226,4 +301,5 @@ def listen_for_emails():
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    ensure_signal_account()
     listen_for_emails()

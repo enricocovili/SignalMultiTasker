@@ -39,6 +39,7 @@ services:
       - SIGNAL_SENDER=${SIGNAL_SENDER}
       - SIGNAL_GROUP_ID=${SIGNAL_GROUP_ID}
       - SIGNAL_API_BASE=http://signal-api:8080
+      - SIGNAL_DEVICE_NAME=${SIGNAL_DEVICE_NAME:-signal-multitasker}
       - OLLAMA_URL=http://ollama:11434
       - OLLAMA_MODEL=${OLLAMA_MODEL:-gemma4:e2b}
       - EMAIL_POLL_INTERVAL=${EMAIL_POLL_INTERVAL:-180}
