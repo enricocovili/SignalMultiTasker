@@ -3,6 +3,7 @@ import imaplib
 import json
 import os
 import time
+from email.utils import parseaddr
 
 import requests
 
@@ -185,6 +186,87 @@ def send_signal_message(message):
         return False
 
 
+# ── Forwarding rules ──────────────────────────────────────────────────────────
+# A rule short-circuits normal forwarding: when an email matches, we send the
+# rule's own message instead of the full "New Email" forward. This keeps noisy,
+# predictable senders (security alerts, login links) to a one-line notice.
+#
+# Each rule is a dict:
+#   {
+#     "name": "<human label, for logs only>",
+#     "match": { "<condition>": "<value>", ... },   # ALL conditions must hold (AND)
+#     "message": "<Signal message to send when matched>",
+#   }
+#
+# Supported match conditions (see MATCHERS). All are case-insensitive. To add a
+# new condition, register a predicate in MATCHERS; to add a new rule, append to
+# RULES. Rules are evaluated top-to-bottom; the first match wins.
+#
+#   sender_contains  — substring of the raw From header (name <addr>)
+#   sender_equals    — exact match of the parsed email address only
+#   subject_contains — substring of the Subject header
+#   subject_equals   — exact match of the whole Subject
+MATCHERS = {
+    "sender_contains": lambda ctx, v: v.casefold() in ctx["sender"].casefold(),
+    "sender_equals": lambda ctx, v: v.casefold() == ctx["sender_addr"].casefold(),
+    "subject_contains": lambda ctx, v: v.casefold() in ctx["subject"].casefold(),
+    "subject_equals": lambda ctx, v: v.casefold() == ctx["subject"].casefold(),
+}
+
+RULES = [
+    {
+        "name": "google-security-alert",
+        "match": {
+            "sender_equals": "no-reply@accounts.google.com",
+            "subject_contains": "Avviso di sicurezza",
+        },
+        "message": (
+            "🔐 **Google account** — a new security event was reported "
+            "(*Avviso di sicurezza*). Check the account activity."
+        ),
+    },
+    {
+        "name": "anthropic-login-link",
+        "match": {
+            "sender_contains": "mail.anthropic.com",
+            "subject_contains": "Your secure link to Claude.ai",
+        },
+        "message": "🔑 **Claude.ai** — a new login link was requested for your account.",
+    },
+    {
+        "name": "cloudflare-login-token",
+        "match": {
+            "sender_equals": "noreply@notify.cloudflare.com",
+            "subject_contains": "Your Cloudflare login token",
+        },
+        "message": "🔑 **Cloudflare** — a new login token was requested for your account.",
+    },
+]
+
+
+def match_rule(sender, subject):
+    """Return the first RULES entry matching this email, or None.
+
+    All conditions in a rule's ``match`` dict must hold. Unknown conditions make
+    a rule never match (fail closed) so a typo can't silently forward nothing.
+    """
+    ctx = {
+        "sender": sender,
+        "sender_addr": parseaddr(sender)[1],
+        "subject": subject,
+    }
+    for rule in RULES:
+        try:
+            if all(
+                cond in MATCHERS and MATCHERS[cond](ctx, value)
+                for cond, value in rule["match"].items()
+            ):
+                return rule
+        except Exception as e:
+            print(f"⚠️ Error evaluating rule {rule.get('name')!r}: {e}")
+    return None
+
+
 # ── Email helpers ─────────────────────────────────────────────────────────────
 def extract_body(msg):
     """Return the plain-text body of an email.message.Message."""
@@ -211,6 +293,13 @@ def process_email(mail, uid):
     subject = msg.get("Subject", "No Subject")
     sender = msg.get("From", "Unknown Sender")
     print(f"📩 New email detected (UID {uid}): {subject}")
+
+    # A matching rule replaces the full forward with its own short notice.
+    rule = match_rule(sender, subject)
+    if rule:
+        print(f"➡️ Matched rule {rule['name']!r}; sending its notice.")
+        send_signal_message(rule["message"])
+        return
 
     body = extract_body(msg)
     summary = body if len(body) < 500 else body[:500] + "...\nMessaggio Troncato"
