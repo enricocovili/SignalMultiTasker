@@ -42,13 +42,31 @@ When changing email logic, preserve these three behaviours and keep using
 `BODY.PEEK` — switching to `SEEN`-based search reintroduces the bug this design
 removed.
 
+### Network resilience (learned from an 11-day silent outage)
+
+The poll loop must never be able to hang or die quietly:
+
+- **Always pass `timeout=IMAP_TIMEOUT` to `IMAP4_SSL`.** Without it imaplib
+  blocks forever on a half-open connection — the container stays `Up`, logs
+  nothing, and no restart policy can recover it.
+- **Close the connection in a `finally`** (`close_imap`), or failed polls leak
+  sockets.
+- **Transient errors** (DNS resolution, refused/reset connections, TLS, read
+  timeouts) are counted, logged, and retried with capped exponential backoff.
+  After `MAX_CONSECUTIVE_FAILURES` the process exits non-zero on purpose so
+  Docker restarts it with fresh DNS state — do not swallow that exit.
+- **`email-bridge` uses `restart: unless-stopped`.** `on-failure` does *not*
+  restart a container after a host reboot or Docker daemon restart; that is what
+  kept the bridge dead from 2026-07-30 to 2026-08-11.
+
 ## Configuration
 
 All config is environment-driven (`os.getenv` in `bridge.py`, wired in
 `docker-compose.yaml`). Secrets live in `.env` (gitignored): `EMAIL_USER`,
 `EMAIL_PASS`, `SIGNAL_SENDER`, `SIGNAL_GROUP_ID`. Tunables include
-`MAX_NEW_EMAILS`, `EMAIL_POLL_INTERVAL`, `OLLAMA_MODEL`. `IMAP_SERVER` is
-hardcoded to `imap.hostinger.com`.
+`MAX_NEW_EMAILS`, `EMAIL_POLL_INTERVAL`, `OLLAMA_MODEL`, `IMAP_TIMEOUT`,
+`MAX_CONSECUTIVE_FAILURES`, `FAILURE_BACKOFF_MAX`. `IMAP_SERVER` is hardcoded to
+`imap.hostinger.com`.
 
 ## Commands
 

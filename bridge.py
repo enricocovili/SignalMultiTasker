@@ -2,6 +2,8 @@ import email
 import imaplib
 import json
 import os
+import socket
+import sys
 import time
 from email.utils import parseaddr
 
@@ -38,6 +40,17 @@ STATE_FILE = os.getenv("STATE_FILE", "/app/state/email_state.json")
 # Timeouts (these calls can be slow on CPU)
 OLLAMA_TIMEOUT = 180
 SIGNAL_TIMEOUT = 60
+
+# Socket timeout for every IMAP operation (connect, login, search, fetch).
+# Without this imaplib blocks forever on a half-open connection: the container
+# stays "Up" but silently stops polling, and no restart policy can save it.
+IMAP_TIMEOUT = int(os.getenv("IMAP_TIMEOUT", "60"))
+
+# Transient network failures (DNS hiccups, dropped links) are normal: back off
+# and retry. But if they never stop, exit non-zero so Docker restarts us with a
+# clean process, fresh DNS state and new sockets, rather than looping forever.
+MAX_CONSECUTIVE_FAILURES = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "10"))
+FAILURE_BACKOFF_MAX = int(os.getenv("FAILURE_BACKOFF_MAX", "300"))
 
 EMAIL_LLM_PROMPT = (
     "You are a summary bot. Summarize the following email in ONE short sentence "
@@ -312,12 +325,28 @@ def process_email(mail, uid):
 
 
 # ── Email loop ────────────────────────────────────────────────────────────────
+def close_imap(mail):
+    """Best-effort logout; never let cleanup mask the original error."""
+    try:
+        mail.logout()
+    except Exception:
+        try:
+            mail.shutdown()
+        except Exception:
+            pass
+
+
 def listen_for_emails():
     print(f"🚀 Email listener started for {EMAIL_USER}...")
 
+    consecutive_failures = 0
+
     while True:
+        mail = None
         try:
-            mail = imaplib.IMAP4_SSL(IMAP_SERVER)
+            # timeout= applies to connect and to every later socket read, so a
+            # stalled server or a network drop raises instead of hanging.
+            mail = imaplib.IMAP4_SSL(IMAP_SERVER, timeout=IMAP_TIMEOUT)
             mail.login(EMAIL_USER, EMAIL_PASS)
             status, select_data = mail.select("inbox")
 
@@ -357,35 +386,58 @@ def listen_for_emails():
                     "be forwarded."
                 )
                 save_state({"uidvalidity": uidvalidity, "last_uid": max_uid})
-                mail.logout()
-                time.sleep(EMAIL_POLL_INTERVAL)
-                continue
-
-            new_uids = sorted(uid for uid in all_uids if uid > last_uid)
-
-            if not new_uids:
-                print("There is not any new mail")
-            elif len(new_uids) > MAX_NEW_EMAILS:
-                # Too many at once — likely a backlog or import; ask for manual review
-                # instead of spamming individual summaries.
-                send_signal_message(
-                    f"⚠️ {len(new_uids)} new emails found (limit {MAX_NEW_EMAILS}). "
-                    "Manual check needed — not forwarding them individually."
-                )
-                save_state({"uidvalidity": uidvalidity, "last_uid": max_uid})
             else:
-                for uid in new_uids:
-                    try:
-                        process_email(mail, str(uid).encode())
-                    except Exception as e:
-                        print(f"⚠️ Error processing email UID {uid}: {e}")
-                save_state({"uidvalidity": uidvalidity, "last_uid": max_uid})
+                new_uids = sorted(uid for uid in all_uids if uid > last_uid)
 
-            mail.logout()
+                if not new_uids:
+                    print("There is not any new mail")
+                elif len(new_uids) > MAX_NEW_EMAILS:
+                    # Too many at once — likely a backlog or import; ask for manual
+                    # review instead of spamming individual summaries.
+                    send_signal_message(
+                        f"⚠️ {len(new_uids)} new emails found (limit {MAX_NEW_EMAILS}). "
+                        "Manual check needed — not forwarding them individually."
+                    )
+                    save_state({"uidvalidity": uidvalidity, "last_uid": max_uid})
+                else:
+                    for uid in new_uids:
+                        try:
+                            process_email(mail, str(uid).encode())
+                        except Exception as e:
+                            print(f"⚠️ Error processing email UID {uid}: {e}")
+                    save_state({"uidvalidity": uidvalidity, "last_uid": max_uid})
+
+            consecutive_failures = 0
+        except (OSError, socket.timeout, imaplib.IMAP4.error) as e:
+            # Transient by nature: DNS resolution failures, refused/reset
+            # connections, TLS errors, read timeouts, server-side hiccups.
+            consecutive_failures += 1
+            print(
+                f"⚠️ Poll failed ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): "
+                f"{type(e).__name__}: {e}"
+            )
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                # Give up on this process: exiting non-zero lets Docker restart
+                # us, which is the only way to recover from a wedged resolver or
+                # a broken network namespace.
+                print("💥 Too many consecutive failures — exiting for a restart.")
+                sys.exit(1)  # `finally` below still closes the connection
         except Exception as e:
-            print(f"⚠️ Error: {e}")
+            consecutive_failures += 1
+            print(f"⚠️ Error: {type(e).__name__}: {e}")
+        finally:
+            if mail is not None:
+                close_imap(mail)
 
-        time.sleep(EMAIL_POLL_INTERVAL)
+        if consecutive_failures:
+            # Exponential backoff, capped, so a flapping network isn't hammered.
+            delay = min(
+                FAILURE_BACKOFF_MAX,
+                EMAIL_POLL_INTERVAL * (2 ** (consecutive_failures - 1)),
+            )
+        else:
+            delay = EMAIL_POLL_INTERVAL
+        time.sleep(delay)
 
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────

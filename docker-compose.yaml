@@ -30,6 +30,11 @@ services:
     container_name: email-bridge
     networks:
       - signal-network
+    # Public resolvers as a fallback: the IMAP host is resolved on every poll,
+    # so a flaky host resolver would otherwise stall the bridge.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     depends_on:
       - signal-api
       - ollama
@@ -45,9 +50,15 @@ services:
       - EMAIL_POLL_INTERVAL=${EMAIL_POLL_INTERVAL:-180}
       - MAX_NEW_EMAILS=${MAX_NEW_EMAILS:-10}
       - STATE_FILE=/app/state/email_state.json
+      - IMAP_TIMEOUT=${IMAP_TIMEOUT:-60}
+      - MAX_CONSECUTIVE_FAILURES=${MAX_CONSECUTIVE_FAILURES:-10}
+      - FAILURE_BACKOFF_MAX=${FAILURE_BACKOFF_MAX:-300}
     volumes:
       - "./bridge_state:/app/state"
-    restart: on-failure
+    # unless-stopped, not on-failure: on-failure does NOT bring the container
+    # back after a host reboot or Docker daemon restart, which silently killed
+    # the bridge for 11 days.
+    restart: unless-stopped
 
 networks:
   signal-network:
