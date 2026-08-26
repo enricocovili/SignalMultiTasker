@@ -39,8 +39,17 @@ MAX_NEW_EMAILS = int(os.getenv("MAX_NEW_EMAILS", "10"))
 # Local state file. Persisted on a volume so it survives container restarts.
 STATE_FILE = os.getenv("STATE_FILE", "/app/state/email_state.json")
 
-# Timeouts (these calls can be slow on CPU)
-SIGNAL_TIMEOUT = 60
+# Timeouts. In MODE=normal signal-api spawns a JVM per request, so even a
+# healthy call costs seconds.
+SIGNAL_TIMEOUT = int(os.getenv("SIGNAL_TIMEOUT", "60"))
+
+# Receiving needs its own, far longer budget than sending: signal-cli's first
+# receive after a start does an initial sync (observed: 2m), and a receive that
+# collides with another signal-cli invocation blocks on the config-file lock
+# (observed: 1m5s). Timing out does not cancel the server-side work — it just
+# abandons a request that keeps running and holding the lock, so the next poll
+# collides too. Too short a value here turns one slow call into a cascade.
+SIGNAL_RECEIVE_TIMEOUT = int(os.getenv("SIGNAL_RECEIVE_TIMEOUT", "300"))
 WHISPER_TIMEOUT = int(os.getenv("WHISPER_TIMEOUT", "600"))
 
 # Socket timeout for every IMAP operation (connect, login, search, fetch).
@@ -359,8 +368,14 @@ def fetch_signal_envelopes():
     """GET /v1/receive/{number} — returns a list of envelopes, consuming them."""
     url = f"{SIGNAL_API_BASE}/v1/receive/{quote(SIGNAL_SENDER, safe='')}"
     params = {"timeout": "1", "ignore_attachments": "false", "ignore_stories": "true"}
+    started = time.monotonic()
     with SIGNAL_LOCK:
-        r = requests.get(url, params=params, timeout=SIGNAL_TIMEOUT)
+        r = requests.get(url, params=params, timeout=SIGNAL_RECEIVE_TIMEOUT)
+    elapsed = time.monotonic() - started
+    if elapsed > 30:
+        # Normal is ~5s. Much longer means an initial sync or lock contention;
+        # surface it, because it also stalls outbound sends behind SIGNAL_LOCK.
+        print(f"🐌 Signal receive took {elapsed:.0f}s (expected ~5s).")
     if r.status_code == 400:
         # signal-cli is busy or returned a transient 400; log body and skip this tick
         print(f"⚠️ Signal /receive 400: {r.text.strip()[:200]}")

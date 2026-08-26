@@ -35,6 +35,10 @@ services:
       SIGNAL_API_BASE: http://signal-api:8080
       SIGNAL_DEVICE_NAME: ${SIGNAL_DEVICE_NAME:-signal-multitasker}
       SIGNAL_POLL_INTERVAL: ${SIGNAL_POLL_INTERVAL:-10}
+      SIGNAL_TIMEOUT: ${SIGNAL_TIMEOUT:-60}
+      # Receives are slow in MODE=normal; timing out early only causes a
+      # broken pipe and lock contention on the next poll.
+      SIGNAL_RECEIVE_TIMEOUT: ${SIGNAL_RECEIVE_TIMEOUT:-300}
       EMAIL_POLL_INTERVAL: ${EMAIL_POLL_INTERVAL:-180}
       MAX_NEW_EMAILS: ${MAX_NEW_EMAILS:-10}
       STATE_FILE: /app/state/email_state.json
