@@ -67,7 +67,10 @@ LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "")
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "180"))
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.2"))
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "160"))
+# Budget for the whole completion, not just the answer. Reasoning models spend
+# it on reasoning_content first and only then emit content — at 160 a 12B
+# reasoning model burns the entire budget thinking and returns an empty string.
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1024"))
 
 # Hard cap on how much text is handed to the model, so a 2 MB newsletter can't
 # blow past the context window (or run up a bill on a per-token provider).
@@ -212,8 +215,19 @@ def summarize(prompt_template, body, subject=""):
         )
         response.raise_for_status()
         choices = response.json().get("choices") or []
-        summary = (choices[0].get("message", {}).get("content") or "").strip()
-        print(f"🧠 LLM summary in {response.elapsed.total_seconds():.1f}s: {summary!r}")
+        choice = choices[0] if choices else {}
+        summary = (choice.get("message", {}).get("content") or "").strip()
+        took = response.elapsed.total_seconds()
+        if not summary and choice.get("finish_reason") == "length":
+            # Classic reasoning-model symptom: the token budget was consumed
+            # before any answer was emitted. Say so, rather than reporting an
+            # anonymous empty summary.
+            print(
+                f"⚠️ LLM returned no content in {took:.1f}s (finish_reason=length) — "
+                f"LLM_MAX_TOKENS={LLM_MAX_TOKENS} is too low for this model."
+            )
+            return None
+        print(f"🧠 LLM summary in {took:.1f}s: {summary!r}")
         return summary or None
     except requests.exceptions.Timeout:
         print(f"⚠️ LLM timed out after {LLM_TIMEOUT}s")

@@ -53,8 +53,10 @@ services:
       LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
       LLM_TIMEOUT: ${LLM_TIMEOUT:-180}
       LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.2}
-      # ~160 tokens is comfortably more than the 2 sentences we ask for.
-      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-160}
+      # Covers the WHOLE completion. A reasoning model spends this on its
+      # reasoning tokens first, so a 2-sentence answer still needs headroom:
+      # too low and it returns an empty string, not a short summary.
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-1024}
       LLM_MAX_INPUT_CHARS: ${LLM_MAX_INPUT_CHARS:-4000}
 
       # The sender is never asked of the model — it is parsed deterministically
