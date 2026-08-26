@@ -13,14 +13,28 @@ services:
     #   docker exec -it ollama ollama pull gemma4:e2b
     restart: unless-stopped
 
+  whisper:
+    image: onerahmet/openai-whisper-asr-webservice:latest
+    container_name: whisper
+    networks:
+      - signal-network
+    environment:
+      # tiny/base/small/medium/large-v3 — bigger is more accurate and much
+      # slower on CPU. Downloaded on first request into the cache volume below.
+      ASR_MODEL: ${ASR_MODEL:-base}
+      ASR_ENGINE: ${ASR_ENGINE:-faster_whisper}
+    volumes:
+      - "./whisper_cache:/root/.cache"
+    restart: unless-stopped
+
   signal-api:
     image: bbernhard/signal-cli-rest-api:latest
     container_name: signal-api
     networks:
       - signal-network
     environment:
-      - MODE=normal #supported modes: json-rpc, native, normal
-      #- AUTO_RECEIVE_SCHEDULE=0 22 * * * #enable this parameter on demand
+      MODE: normal # supported modes: json-rpc, native, normal
+      # AUTO_RECEIVE_SCHEDULE: "0 22 * * *" # enable this parameter on demand
     volumes:
       - "./signal-cli-config:/home/.local/share/signal-cli"
     restart: unless-stopped
@@ -38,21 +52,66 @@ services:
     depends_on:
       - signal-api
       - ollama
+      - whisper
+    # Map form (not the `- KEY=value` list) so the prompts below can be YAML
+    # block scalars: their {subject}/{body} placeholders would otherwise be
+    # mangled by compose's ${...} interpolation.
     environment:
-      - EMAIL_USER=${EMAIL_USER}
-      - EMAIL_PASS=${EMAIL_PASS}
-      - SIGNAL_SENDER=${SIGNAL_SENDER}
-      - SIGNAL_GROUP_ID=${SIGNAL_GROUP_ID}
-      - SIGNAL_API_BASE=http://signal-api:8080
-      - SIGNAL_DEVICE_NAME=${SIGNAL_DEVICE_NAME:-signal-multitasker}
-      - OLLAMA_URL=http://ollama:11434
-      - OLLAMA_MODEL=${OLLAMA_MODEL:-gemma4:e2b}
-      - EMAIL_POLL_INTERVAL=${EMAIL_POLL_INTERVAL:-180}
-      - MAX_NEW_EMAILS=${MAX_NEW_EMAILS:-10}
-      - STATE_FILE=/app/state/email_state.json
-      - IMAP_TIMEOUT=${IMAP_TIMEOUT:-60}
-      - MAX_CONSECUTIVE_FAILURES=${MAX_CONSECUTIVE_FAILURES:-10}
-      - FAILURE_BACKOFF_MAX=${FAILURE_BACKOFF_MAX:-300}
+      EMAIL_USER: ${EMAIL_USER}
+      EMAIL_PASS: ${EMAIL_PASS}
+      SIGNAL_SENDER: ${SIGNAL_SENDER}
+      SIGNAL_GROUP_ID: ${SIGNAL_GROUP_ID}
+      SIGNAL_API_BASE: http://signal-api:8080
+      SIGNAL_DEVICE_NAME: ${SIGNAL_DEVICE_NAME:-signal-multitasker}
+      SIGNAL_POLL_INTERVAL: ${SIGNAL_POLL_INTERVAL:-10}
+      EMAIL_POLL_INTERVAL: ${EMAIL_POLL_INTERVAL:-180}
+      MAX_NEW_EMAILS: ${MAX_NEW_EMAILS:-10}
+      STATE_FILE: /app/state/email_state.json
+      IMAP_TIMEOUT: ${IMAP_TIMEOUT:-60}
+      MAX_CONSECUTIVE_FAILURES: ${MAX_CONSECUTIVE_FAILURES:-10}
+      FAILURE_BACKOFF_MAX: ${FAILURE_BACKOFF_MAX:-300}
+
+      # ── LLM (Ollama) ──────────────────────────────────────────────────────
+      # Summaries are on by default for every forwarded email and voice note.
+      # All of the LLM's behaviour is configured here; bridge.py reads it from
+      # the environment and needs no edit to retune.
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:e2b}
+      OLLAMA_TIMEOUT: ${OLLAMA_TIMEOUT:-180}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.2}
+      # ~160 tokens is comfortably more than the 2 sentences we ask for.
+      LLM_NUM_PREDICT: ${LLM_NUM_PREDICT:-160}
+      LLM_NUM_CTX: ${LLM_NUM_CTX:-4096}
+      LLM_MAX_INPUT_CHARS: ${LLM_MAX_INPUT_CHARS:-4000}
+
+      # The sender is never asked of the model — it is parsed deterministically
+      # from the From header — so the prompt only has to yield the intention.
+      # Placeholders: {subject}, {body}.
+      EMAIL_SUMMARY_PROMPT: |-
+        You summarise emails for a notification bot.
+        In AT MOST 2 short sentences, state what the email is about and what it asks the reader to do (if anything).
+        Rules: write in the same language as the email; do not mention or guess the sender; do not greet, introduce yourself or add any preamble; no bullet points, no markdown, no quotes. Output only the summary.
+
+        Subject: {subject}
+
+        Body:
+        {body}
+      # Placeholder: {body} (the Whisper transcript).
+      VOICE_SUMMARY_PROMPT: |-
+        You summarise voice messages for a notification bot.
+        In AT MOST 2 short sentences, state what the speaker says and what they ask for (if anything).
+        Rules: write in the same language as the transcript; do not greet, introduce yourself or add any preamble; no bullet points, no markdown, no quotes. Output only the summary.
+
+        Transcript:
+        {body}
+
+      # ── Whisper (speech-to-text) ──────────────────────────────────────────
+      WHISPER_URL: http://whisper:9000
+      # Empty = let Whisper auto-detect the spoken language.
+      WHISPER_LANG: ${WHISPER_LANG:-}
+      WHISPER_TASK: ${WHISPER_TASK:-transcribe}
+      WHISPER_TIMEOUT: ${WHISPER_TIMEOUT:-600}
+      VOICE_INCLUDE_TRANSCRIPT: ${VOICE_INCLUDE_TRANSCRIPT:-false}
     volumes:
       - "./bridge_state:/app/state"
     # unless-stopped, not on-failure: on-failure does NOT bring the container

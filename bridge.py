@@ -3,9 +3,11 @@ import imaplib
 import json
 import os
 import socket
-import sys
+import threading
 import time
+from email.header import decode_header, make_header
 from email.utils import parseaddr
+from urllib.parse import quote
 
 import requests
 
@@ -25,8 +27,8 @@ SIGNAL_DEVICE_NAME = os.getenv("SIGNAL_DEVICE_NAME", "signal-multitasker")
 SIGNAL_LINK_QR_PATH = os.getenv("SIGNAL_LINK_QR_PATH", "/app/state/signal-link-qr.png")
 SIGNAL_AUTH_POLL_INTERVAL = int(os.getenv("SIGNAL_AUTH_POLL_INTERVAL", "5"))
 
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:e2b")
+# How often the voice-note loop drains the Signal inbox.
+SIGNAL_POLL_INTERVAL = int(os.getenv("SIGNAL_POLL_INTERVAL", "10"))
 
 EMAIL_POLL_INTERVAL = int(os.getenv("EMAIL_POLL_INTERVAL", "180"))
 
@@ -38,8 +40,8 @@ MAX_NEW_EMAILS = int(os.getenv("MAX_NEW_EMAILS", "10"))
 STATE_FILE = os.getenv("STATE_FILE", "/app/state/email_state.json")
 
 # Timeouts (these calls can be slow on CPU)
-OLLAMA_TIMEOUT = 180
 SIGNAL_TIMEOUT = 60
+WHISPER_TIMEOUT = int(os.getenv("WHISPER_TIMEOUT", "600"))
 
 # Socket timeout for every IMAP operation (connect, login, search, fetch).
 # Without this imaplib blocks forever on a half-open connection: the container
@@ -52,11 +54,64 @@ IMAP_TIMEOUT = int(os.getenv("IMAP_TIMEOUT", "60"))
 MAX_CONSECUTIVE_FAILURES = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "10"))
 FAILURE_BACKOFF_MAX = int(os.getenv("FAILURE_BACKOFF_MAX", "300"))
 
-EMAIL_LLM_PROMPT = (
-    "You are a summary bot. Summarize the following email in ONE short sentence "
-    "suitable for a Signal message. Ignore headers and signatures.\n\n"
-    "Email Content: {body}"
+# ── LLM configuration ─────────────────────────────────────────────────────────
+# Everything the LLM does is configured from the environment (wired in
+# docker-compose.yaml) — endpoint, model, decoding options, input budget and the
+# two prompts. Nothing here should need a code change to retune.
+LLM_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
+LLM_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:e2b")
+LLM_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "180"))
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.2"))
+LLM_NUM_PREDICT = int(os.getenv("LLM_NUM_PREDICT", "160"))
+LLM_NUM_CTX = int(os.getenv("LLM_NUM_CTX", "4096"))
+
+# Hard cap on how much text is handed to the model, so a 2 MB newsletter can't
+# blow past the context window (and stall a CPU-only Ollama for minutes).
+LLM_MAX_INPUT_CHARS = int(os.getenv("LLM_MAX_INPUT_CHARS", "4000"))
+
+# Both prompts may use {subject} and {body}; unknown placeholders render empty.
+EMAIL_SUMMARY_PROMPT = os.getenv(
+    "EMAIL_SUMMARY_PROMPT",
+    "You summarise emails for a notification bot.\n"
+    "In AT MOST 2 short sentences, state what the email is about and what it "
+    "asks the reader to do (if anything).\n"
+    "Rules: write in the same language as the email; do not mention or guess "
+    "the sender; do not greet, introduce yourself or add any preamble; no "
+    "bullet points, no markdown, no quotes. Output only the summary.\n\n"
+    "Subject: {subject}\n\n"
+    "Body:\n{body}",
 )
+VOICE_SUMMARY_PROMPT = os.getenv(
+    "VOICE_SUMMARY_PROMPT",
+    "You summarise voice messages for a notification bot.\n"
+    "In AT MOST 2 short sentences, state what the speaker says and what they "
+    "ask for (if anything).\n"
+    "Rules: write in the same language as the transcript; do not greet, "
+    "introduce yourself or add any preamble; no bullet points, no markdown, no "
+    "quotes. Output only the summary.\n\n"
+    "Transcript:\n{body}",
+)
+
+# ── Whisper configuration ─────────────────────────────────────────────────────
+WHISPER_URL = os.getenv("WHISPER_URL", "http://whisper:9000")
+# Empty means "let Whisper auto-detect the language".
+WHISPER_LANG = os.getenv("WHISPER_LANG", "")
+WHISPER_TASK = os.getenv("WHISPER_TASK", "transcribe")
+
+# Include the raw transcript alongside the summary in the Signal reply.
+VOICE_INCLUDE_TRANSCRIPT = os.getenv("VOICE_INCLUDE_TRANSCRIPT", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+VOICE_PENDING_MESSAGE = os.getenv(
+    "VOICE_PENDING_MESSAGE", "🎧 Transcribing and summarizing voice message..."
+)
+
+# signal-cli serialises access to the account store: a send issued while a
+# receive is running fails with a lock error. One lock around every signal-api
+# call keeps the email loop and the voice loop from stepping on each other.
+SIGNAL_LOCK = threading.Lock()
 
 
 # ── Local state ───────────────────────────────────────────────────────────────
@@ -81,41 +136,59 @@ def save_state(state):
     os.replace(tmp, STATE_FILE)
 
 
-# ── Ollama ────────────────────────────────────────────────────────────────────
-def get_llm_summary(text, prompt_template=EMAIL_LLM_PROMPT):
-    """Send text to Ollama and return a short summary, or None on failure."""
+# ── LLM ───────────────────────────────────────────────────────────────────────
+class _SafeFields(dict):
+    """Render unknown {placeholders} as empty instead of raising KeyError.
+
+    The prompts are user-editable via the environment, so a stray placeholder
+    must degrade the summary, not kill the poll loop.
+    """
+
+    def __missing__(self, key):
+        return ""
+
+
+def summarize(prompt_template, body, subject=""):
+    """Return a short LLM summary of ``body``, or None if the LLM is unusable.
+
+    Callers must handle None: Ollama is a best-effort dependency, a summary is
+    never worth dropping a notification over.
+    """
+    prompt = prompt_template.format_map(
+        _SafeFields(body=(body or "")[:LLM_MAX_INPUT_CHARS], subject=subject or "")
+    )
     payload = {
-        "model": OLLAMA_MODEL,
-        "messages": [
-            {"role": "user", "content": prompt_template.format(body=text[:3000])},
-        ],
+        "model": LLM_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
         "stream": False,
         "options": {
-            "temperature": 0.3,
-            "num_predict": 512,
+            "temperature": LLM_TEMPERATURE,
+            "num_predict": LLM_NUM_PREDICT,
+            "num_ctx": LLM_NUM_CTX,
         },
     }
     try:
         response = requests.post(
-            f"{OLLAMA_URL}/api/chat", json=payload, timeout=OLLAMA_TIMEOUT
+            f"{LLM_URL}/api/chat", json=payload, timeout=LLM_TIMEOUT
         )
         response.raise_for_status()
         data = response.json()
-        print(f"DEBUG: LLM inference time: {response.elapsed.total_seconds():.1f}s")
-        print(f"DEBUG: {data}")
-        return (data.get("message", {}).get("content") or "").strip()
+        summary = (data.get("message", {}).get("content") or "").strip()
+        print(f"🧠 LLM summary in {response.elapsed.total_seconds():.1f}s: {summary!r}")
+        return summary or None
     except requests.exceptions.Timeout:
-        print("⚠️ Ollama timed out")
+        print(f"⚠️ LLM timed out after {LLM_TIMEOUT}s")
         return None
     except Exception as e:
-        print(f"⚠️ Error generating summary: {e}")
+        print(f"⚠️ LLM error: {type(e).__name__}: {e}")
         return None
 
 
 # ── Signal auth ───────────────────────────────────────────────────────────────
 def signal_registered_numbers():
     """Return the list of accounts registered/linked in signal-api."""
-    r = requests.get(f"{SIGNAL_API_BASE}/v1/accounts", timeout=SIGNAL_TIMEOUT)
+    with SIGNAL_LOCK:
+        r = requests.get(f"{SIGNAL_API_BASE}/v1/accounts", timeout=SIGNAL_TIMEOUT)
     r.raise_for_status()
     return r.json() or []
 
@@ -125,11 +198,12 @@ def fetch_link_qr():
 
     Each call creates a fresh linking URI, so call it once per link attempt.
     """
-    r = requests.get(
-        f"{SIGNAL_API_BASE}/v1/qrcodelink",
-        params={"device_name": SIGNAL_DEVICE_NAME},
-        timeout=SIGNAL_TIMEOUT,
-    )
+    with SIGNAL_LOCK:
+        r = requests.get(
+            f"{SIGNAL_API_BASE}/v1/qrcodelink",
+            params={"device_name": SIGNAL_DEVICE_NAME},
+            timeout=SIGNAL_TIMEOUT,
+        )
     r.raise_for_status()
     os.makedirs(os.path.dirname(SIGNAL_LINK_QR_PATH), exist_ok=True)
     with open(SIGNAL_LINK_QR_PATH, "wb") as f:
@@ -180,29 +254,114 @@ def ensure_signal_account():
 
 
 # ── Signal helpers ────────────────────────────────────────────────────────────
-def send_signal_message(message):
+def send_signal_message(message, recipient=None):
+    """Send a styled message. Returns the send timestamp, or None on failure.
+
+    The timestamp is what identifies the message later — it is the handle needed
+    to remote-delete the "transcribing…" placeholder.
+    """
     payload = {
         "message": message,
         "number": SIGNAL_SENDER,
-        "recipients": [SIGNAL_GROUP_ID],
+        "recipients": [recipient or SIGNAL_GROUP_ID],
         "text_mode": "styled",
     }
     try:
-        r = requests.post(SIGNAL_API_URL, json=payload, timeout=SIGNAL_TIMEOUT)
+        with SIGNAL_LOCK:
+            r = requests.post(SIGNAL_API_URL, json=payload, timeout=SIGNAL_TIMEOUT)
         if r.status_code == 201:
             print("✅ Successfully forwarded to Signal.")
-            return True
+            # 201 bodies carry {"timestamp": "<millis as string>"}.
+            try:
+                return int(r.json().get("timestamp"))
+            except Exception:
+                return None
         print(f"❌ Failed to send: {r.text}")
-        return False
+        return None
     except Exception as e:
         print(f"⚠️ Signal send error: {e}")
+        return None
+
+
+def delete_signal_message(timestamp, recipient=None):
+    """Remote-delete one of our own sent messages (removes it for everyone)."""
+    if not timestamp:
         return False
+    url = f"{SIGNAL_API_BASE}/v1/remote-delete/{quote(SIGNAL_SENDER, safe='')}"
+    payload = {"recipient": recipient or SIGNAL_GROUP_ID, "timestamp": int(timestamp)}
+    try:
+        with SIGNAL_LOCK:
+            r = requests.delete(url, json=payload, timeout=SIGNAL_TIMEOUT)
+        if r.status_code in (200, 201, 204):
+            print(f"🗑️ Deleted placeholder message {timestamp}.")
+            return True
+        print(f"⚠️ Could not delete message {timestamp}: {r.status_code} {r.text}")
+        return False
+    except Exception as e:
+        print(f"⚠️ Signal delete error: {e}")
+        return False
+
+
+def fetch_signal_envelopes():
+    """GET /v1/receive/{number} — returns a list of envelopes, consuming them."""
+    url = f"{SIGNAL_API_BASE}/v1/receive/{quote(SIGNAL_SENDER, safe='')}"
+    params = {"timeout": "1", "ignore_attachments": "false", "ignore_stories": "true"}
+    with SIGNAL_LOCK:
+        r = requests.get(url, params=params, timeout=SIGNAL_TIMEOUT)
+    if r.status_code == 400:
+        # signal-cli is busy or returned a transient 400; log body and skip this tick
+        print(f"⚠️ Signal /receive 400: {r.text.strip()[:200]}")
+        return []
+    r.raise_for_status()
+    return r.json() or []
+
+
+def download_attachment(att_id):
+    with SIGNAL_LOCK:
+        r = requests.get(
+            f"{SIGNAL_API_BASE}/v1/attachments/{att_id}", timeout=SIGNAL_TIMEOUT
+        )
+    r.raise_for_status()
+    return r.content
+
+
+def delete_attachment(att_id):
+    """Drop the downloaded audio from the signal-api container's disk."""
+    try:
+        with SIGNAL_LOCK:
+            requests.delete(
+                f"{SIGNAL_API_BASE}/v1/attachments/{att_id}", timeout=SIGNAL_TIMEOUT
+            )
+    except Exception as e:
+        print(f"⚠️ Could not delete attachment {att_id}: {e}")
+
+
+# ── Whisper ───────────────────────────────────────────────────────────────────
+def transcribe_audio(audio_bytes, filename="voice.ogg"):
+    """Upload audio bytes to the Whisper ASR webservice and return the text."""
+    params = {"task": WHISPER_TASK, "output": "json", "encode": "true"}
+    if WHISPER_LANG:
+        params["language"] = WHISPER_LANG
+    files = {"audio_file": (filename, audio_bytes)}
+    try:
+        r = requests.post(
+            f"{WHISPER_URL}/asr", params=params, files=files, timeout=WHISPER_TIMEOUT
+        )
+        r.raise_for_status()
+        return (r.json().get("text") or "").strip()
+    except requests.exceptions.Timeout:
+        print(f"⚠️ Whisper timed out after {WHISPER_TIMEOUT}s")
+        return None
+    except Exception as e:
+        print(f"⚠️ Whisper error: {type(e).__name__}: {e}")
+        return None
 
 
 # ── Forwarding rules ──────────────────────────────────────────────────────────
 # A rule short-circuits normal forwarding: when an email matches, we send the
 # rule's own message instead of the full "New Email" forward. This keeps noisy,
-# predictable senders (security alerts, login links) to a one-line notice.
+# predictable senders (security alerts, login links) to a one-line notice and
+# skips the LLM entirely.
 #
 # Each rule is a dict:
 #   {
@@ -215,9 +374,9 @@ def send_signal_message(message):
 # new condition, register a predicate in MATCHERS; to add a new rule, append to
 # RULES. Rules are evaluated top-to-bottom; the first match wins.
 #
-#   sender_contains  — substring of the raw From header (name <addr>)
+#   sender_contains  — substring of the decoded From header (name <addr>)
 #   sender_equals    — exact match of the parsed email address only
-#   subject_contains — substring of the Subject header
+#   subject_contains — substring of the decoded Subject header
 #   subject_equals   — exact match of the whole Subject
 MATCHERS = {
     "sender_contains": lambda ctx, v: v.casefold() in ctx["sender"].casefold(),
@@ -257,17 +416,13 @@ RULES = [
 ]
 
 
-def match_rule(sender, subject):
+def match_rule(sender_addr, sender, subject):
     """Return the first RULES entry matching this email, or None.
 
     All conditions in a rule's ``match`` dict must hold. Unknown conditions make
     a rule never match (fail closed) so a typo can't silently forward nothing.
     """
-    ctx = {
-        "sender": sender,
-        "sender_addr": parseaddr(sender)[1],
-        "subject": subject,
-    }
+    ctx = {"sender": sender, "sender_addr": sender_addr, "subject": subject}
     for rule in RULES:
         try:
             if all(
@@ -281,6 +436,37 @@ def match_rule(sender, subject):
 
 
 # ── Email helpers ─────────────────────────────────────────────────────────────
+def decode_mime(value):
+    """Decode an RFC 2047 encoded header (=?utf-8?B?…?=) into plain text."""
+    if not value:
+        return ""
+    try:
+        return str(make_header(decode_header(value))).strip()
+    except Exception:
+        return value.strip()
+
+
+def extract_sender(msg):
+    """Return ``(display, address)`` for the From header — no LLM involved.
+
+    The sender is parsed deterministically from the header rather than inferred
+    from the body: the model never sees it and can never get it wrong.
+    """
+    raw = msg.get("From", "")
+    name, addr = parseaddr(raw)
+    name = decode_mime(name)
+    addr = addr.strip()
+    # parseaddr yields a bare token as the "address" for a malformed From
+    # (e.g. "From: Weird Name Only"). Only an @ makes it a real address.
+    if "@" not in addr:
+        addr = ""
+    if name and addr:
+        display = f"{name} <{addr}>"
+    else:
+        display = addr or decode_mime(raw) or "Unknown Sender"
+    return display, addr
+
+
 def extract_body(msg):
     """Return the plain-text body of an email.message.Message."""
     if msg.is_multipart():
@@ -303,25 +489,138 @@ def process_email(mail, uid):
         return
 
     msg = email.message_from_bytes(data[0][1])
-    subject = msg.get("Subject", "No Subject")
-    sender = msg.get("From", "Unknown Sender")
+    subject = decode_mime(msg.get("Subject", "")) or "No Subject"
+    sender, sender_addr = extract_sender(msg)
     print(f"📩 New email detected (UID {uid}): {subject}")
 
     # A matching rule replaces the full forward with its own short notice.
-    rule = match_rule(sender, subject)
+    rule = match_rule(sender_addr, sender, subject)
     if rule:
         print(f"➡️ Matched rule {rule['name']!r}; sending its notice.")
         send_signal_message(rule["message"])
         return
 
     body = extract_body(msg)
-    summary = body if len(body) < 500 else body[:500] + "...\nMessaggio Troncato"
+    # The LLM only ever produces the "what does this mail want" line. If it is
+    # down, fall back to a truncated body so the mail is still forwarded.
+    summary = summarize(EMAIL_SUMMARY_PROMPT, body, subject=subject)
+    if summary:
+        label = "Summary"
+    else:
+        label = "Excerpt"
+        summary = body.strip()
+        if len(summary) > 500:
+            summary = summary[:500] + "...\nMessaggio Troncato"
 
     message = f"📩 **New Email**\n\n**From:** {sender}\n\n**Subject:** {subject}"
     if summary:
-        message += f"\n\n**Summary:** {summary}"
+        message += f"\n\n**{label}:** {summary}"
 
     send_signal_message(message)
+
+
+# ── Voice-note loop ───────────────────────────────────────────────────────────
+def conversation_recipient(envelope, data):
+    """Where to reply: the group the note came from, else the 1:1 conversation.
+
+    For a sync message (the owner's own note, echoed to this linked device) the
+    envelope source is *us*, so the conversation is the message's ``destination``.
+    """
+    group_id = (data.get("groupInfo") or {}).get("groupId")
+    if group_id:
+        return group_id if group_id.startswith("group.") else f"group.{group_id}"
+    return (
+        data.get("destinationNumber")
+        or data.get("destination")
+        or envelope.get("sourceNumber")
+        or envelope.get("source")
+        or SIGNAL_GROUP_ID
+    )
+
+
+def process_voice_attachment(att, sender, recipient):
+    """Acknowledge, transcribe, summarise, answer — then drop the ack."""
+    att_id = att.get("id")
+    if not att_id:
+        return
+    filename = att.get("filename") or f"{att_id}.ogg"
+    print(f"🎤 Voice note from {sender} ({att.get('contentType')}, id={att_id})")
+
+    # Tell the chat we're on it: Whisper + the LLM take tens of seconds on CPU
+    # and silence looks like a broken bridge.
+    pending_ts = send_signal_message(VOICE_PENDING_MESSAGE, recipient=recipient)
+
+    try:
+        audio = download_attachment(att_id)
+        transcript = transcribe_audio(audio, filename=filename)
+        if not transcript:
+            send_signal_message(
+                "⚠️ Could not transcribe the voice message.", recipient=recipient
+            )
+            return
+
+        print(f"📝 Transcript ({len(transcript)} chars): {transcript[:120]}...")
+        summary = summarize(VOICE_SUMMARY_PROMPT, transcript)
+
+        msg = f"🎤 **Voice message** from {sender}"
+        if summary:
+            msg += f"\n\n**Summary:** {summary}"
+            if VOICE_INCLUDE_TRANSCRIPT:
+                msg += f"\n\n**Transcript:** {transcript}"
+        else:
+            # No summary available — the transcript is better than nothing.
+            msg += f"\n\n**Transcript:** {transcript}"
+        send_signal_message(msg, recipient=recipient)
+    finally:
+        # Always retract the placeholder, including on a failure path, so the
+        # chat is never left with a "transcribing…" that never resolves.
+        delete_signal_message(pending_ts, recipient=recipient)
+        delete_attachment(att_id)
+
+
+def iter_voice_messages(envelopes):
+    """Yield ``(envelope, data_message)`` pairs that carry audio attachments.
+
+    Voice notes reach a *linked* device two ways: from other people as a
+    ``dataMessage``, and from the user's own phone as ``syncMessage.sentMessage``.
+    Both are handled, or the bridge would ignore the owner's own voice notes.
+    """
+    for env in envelopes:
+        envelope = env.get("envelope", {}) if isinstance(env, dict) else {}
+        candidates = [envelope.get("dataMessage")]
+        sync = envelope.get("syncMessage") or {}
+        candidates.append(sync.get("sentMessage"))
+        for data in candidates:
+            if not data:
+                continue
+            if any(
+                (att.get("contentType") or "").startswith("audio/")
+                for att in (data.get("attachments") or [])
+            ):
+                yield envelope, data
+
+
+def listen_for_voice_notes():
+    print(f"🎙️  Voice-note listener started for {SIGNAL_SENDER}...")
+    while True:
+        try:
+            for envelope, data in iter_voice_messages(fetch_signal_envelopes()):
+                sender = (
+                    envelope.get("sourceName") or envelope.get("source") or "unknown"
+                )
+                recipient = conversation_recipient(envelope, data)
+                for att in data.get("attachments") or []:
+                    if not (att.get("contentType") or "").startswith("audio/"):
+                        continue
+                    try:
+                        process_voice_attachment(att, sender, recipient)
+                    except Exception as e:
+                        print(f"⚠️ Error processing voice attachment: {e}")
+        except requests.exceptions.RequestException as e:
+            print(f"⚠️ Signal receive error: {e}")
+        except Exception as e:
+            print(f"⚠️ Voice loop error: {type(e).__name__}: {e}")
+        time.sleep(SIGNAL_POLL_INTERVAL)
 
 
 # ── Email loop ────────────────────────────────────────────────────────────────
@@ -343,6 +642,7 @@ def listen_for_emails():
 
     while True:
         mail = None
+        fatal = False
         try:
             # timeout= applies to connect and to every later socket read, so a
             # stalled server or a network drop raises instead of hanging.
@@ -419,15 +719,21 @@ def listen_for_emails():
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                 # Give up on this process: exiting non-zero lets Docker restart
                 # us, which is the only way to recover from a wedged resolver or
-                # a broken network namespace.
+                # a broken network namespace. Flagged rather than exited here so
+                # the `finally` below still closes the IMAP connection.
                 print("💥 Too many consecutive failures — exiting for a restart.")
-                sys.exit(1)  # `finally` below still closes the connection
+                fatal = True
         except Exception as e:
             consecutive_failures += 1
             print(f"⚠️ Error: {type(e).__name__}: {e}")
         finally:
             if mail is not None:
                 close_imap(mail)
+
+        if fatal:
+            # os._exit, not sys.exit: SystemExit only unwinds the calling thread,
+            # and the daemon voice thread must not be able to keep us alive.
+            os._exit(1)
 
         if consecutive_failures:
             # Exponential backoff, capped, so a flapping network isn't hammered.
@@ -443,4 +749,7 @@ def listen_for_emails():
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     ensure_signal_account()
+    threading.Thread(
+        target=listen_for_voice_notes, name="voice-loop", daemon=True
+    ).start()
     listen_for_emails()

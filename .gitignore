@@ -223,3 +223,4 @@ __marimo__/
 ollama_data
 signal-cli-config
 bridge_state
+whisper_cache
