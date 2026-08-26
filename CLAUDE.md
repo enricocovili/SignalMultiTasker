@@ -12,7 +12,7 @@ multi-container `docker compose` stack.
 
 ## Architecture
 
-Four services on the `signal-network` bridge network (`docker-compose.yaml`):
+Two services on the `signal-network` bridge network (`docker-compose.yaml`):
 
 - **`email-bridge`** — built from `Dockerfile`, runs `bridge.py`. The only
   custom code. Two loops: the email poll loop runs on the main thread, the
@@ -21,15 +21,15 @@ Four services on the `signal-network` bridge network (`docker-compose.yaml`):
   `/v2/send` with `text_mode: styled`; inbound drain via `GET /v1/receive/{number}`;
   the placeholder retraction uses `DELETE /v1/remote-delete/{number}`. State
   (linked Signal account) lives in the `signal-cli-config` volume.
-- **`ollama`** — LLM summariser, reached at `/api/chat`.
-  **The model must be pulled manually after first start** (see Commands).
-- **`whisper`** — `onerahmet/openai-whisper-asr-webservice`, speech-to-text at
-  `/asr`. The ASR model downloads itself on first request into `whisper_cache`.
+
+Summarisation and speech-to-text are **external, keyed providers**, not
+containers. Both are assumed to speak the OpenAI-compatible surface, and both
+are optional at runtime.
 
 `SIGNAL_LOCK` serialises *every* call to signal-api. signal-cli takes a file
 lock on the account store, so a send issued while a receive is in flight fails;
-the two loops must not race. Whisper and Ollama calls stay outside the lock —
-they take tens of seconds.
+the two loops must not race. Provider calls (LLM, transcription) stay outside
+the lock — they take tens of seconds.
 
 The email loop signals a fatal restart with `os._exit(1)`, not `sys.exit`:
 `SystemExit` only unwinds the calling thread and the daemon voice thread must
@@ -46,15 +46,26 @@ the single entry point for both.
   Do not "improve" this by letting the model read it off the body.
 - **The model produces only the intention**, in at most 2 sentences, in the
   source language, with no preamble or markdown.
-- **All LLM config lives in `docker-compose.yaml`** — endpoint, model, timeout,
-  temperature, `num_predict`, `num_ctx`, input char cap, and both prompts. The
+- **The provider is any OpenAI-compatible chat-completions endpoint.**
+  `LLM_URL` is the API *base* (ending in `/v1`) and the code appends
+  `/chat/completions`; `LLM_API_KEY` becomes a `Bearer` header via `bearer()`.
+  Keep the client provider-agnostic — no vendor SDK, no vendor-specific fields.
+- **The key is optional by design.** `bearer()` returns `{}` when it is unset,
+  so the bridge can also point at an unauthenticated endpoint on a trusted
+  network. Keys live in `.env`, never in `docker-compose.yaml`.
+- **All LLM config lives in `docker-compose.yaml`** — endpoint, key, model,
+  timeout, temperature, `max_tokens`, input char cap, and both prompts. The
   `bridge.py` constants are only fallback defaults; retuning must not need a
   code change. The prompts are YAML block scalars in the map-form `environment:`
   block *on purpose*: in the `- KEY=value` list form, the `{subject}`/`{body}`
   placeholders break compose's `${...}` interpolation.
-- `summarize()` returns `None` on any failure. Callers must degrade, never drop:
-  emails fall back to a truncated body excerpt, voice notes to the raw
-  transcript. A dead Ollama must not cost a notification.
+- `summarize()` returns `None` on any failure — including unset `LLM_URL` or
+  `LLM_MODEL`, which it checks before making a call. Callers must degrade, never
+  drop: emails fall back to a truncated body excerpt, voice notes to the raw
+  transcript. An unreachable provider must not cost a notification.
+- `check_provider_config()` runs at startup and **warns without exiting**.
+  Forwarding mail is the job that must not stop because a provider is
+  misconfigured.
 - Rule matches (see below) short-circuit *before* the LLM — no summary is
   generated for them.
 
@@ -62,6 +73,8 @@ the single entry point for both.
 
 `listen_for_voice_notes()` drains `/v1/receive` every `SIGNAL_POLL_INTERVAL`
 seconds and handles any attachment whose `contentType` starts with `audio/`.
+Transcription posts multipart `file` + `model` to
+`{WHISPER_URL}/audio/transcriptions` with `WHISPER_API_KEY` as a `Bearer` header.
 
 - Both `dataMessage` (someone else's voice note) and `syncMessage.sentMessage`
   (a voice note sent from the owner's own phone) are handled. This bridge is a
@@ -69,7 +82,7 @@ seconds and handles any attachment whose `contentType` starts with `audio/`.
 - The flow is: send "🎧 Transcribing and summarizing voice message…", capture the
   send timestamp, download the attachment, Whisper, LLM, send the result, then
   remote-delete the placeholder. **The delete lives in a `finally`** so a
-  Whisper or LLM failure can never leave a "transcribing…" hanging forever.
+  transcription or LLM failure can never leave a "transcribing…" hanging forever.
 - Replies go back to the conversation the note came from
   (`conversation_recipient()`), falling back to `SIGNAL_GROUP_ID`.
 
@@ -114,22 +127,20 @@ The poll loop must never be able to hang or die quietly:
 
 All config is environment-driven (`os.getenv` in `bridge.py`, wired in
 `docker-compose.yaml`). Secrets live in `.env` (gitignored): `EMAIL_USER`,
-`EMAIL_PASS`, `SIGNAL_SENDER`, `SIGNAL_GROUP_ID`. Tunables include
-`MAX_NEW_EMAILS`, `EMAIL_POLL_INTERVAL`, `SIGNAL_POLL_INTERVAL`, `IMAP_TIMEOUT`,
-`MAX_CONSECUTIVE_FAILURES`, `FAILURE_BACKOFF_MAX`, the `OLLAMA_*`/`LLM_*` block,
-and `ASR_MODEL` / `WHISPER_*` / `VOICE_INCLUDE_TRANSCRIPT`. `IMAP_SERVER` is
-hardcoded to `imap.hostinger.com`.
+`EMAIL_PASS`, `SIGNAL_SENDER`, `SIGNAL_GROUP_ID`, `LLM_API_KEY`,
+`WHISPER_API_KEY`. `.env.example` is the tracked template — add every new
+variable there. Tunables include `MAX_NEW_EMAILS`, `EMAIL_POLL_INTERVAL`,
+`SIGNAL_POLL_INTERVAL`, `IMAP_TIMEOUT`, `MAX_CONSECUTIVE_FAILURES`,
+`FAILURE_BACKOFF_MAX`, the `LLM_*` block, and `WHISPER_*` /
+`VOICE_INCLUDE_TRANSCRIPT`. `IMAP_SERVER` is hardcoded to `imap.hostinger.com`.
 
 ## Commands
 
 ```bash
-# Build and start the stack
+# Build and start the stack (fill in .env first — see .env.example)
 docker compose up -d --build
 
-# Pull the Ollama model once (required before summaries work)
-docker exec -it ollama ollama pull gemma4:e2b
-
-# Follow bridge logs
+# Follow bridge logs; the first lines report any unset provider config
 docker compose logs -f email-bridge
 
 # Validate compose file

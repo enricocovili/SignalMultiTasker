@@ -1,32 +1,4 @@
 services:
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
-    networks:
-      - signal-network
-    volumes:
-      - "./ollama_data:/root/.ollama"
-    # NOTE: after `docker compose up -d`, run once to pull the model:
-    #   docker exec -it ollama ollama pull gemma4:e2b
-    restart: unless-stopped
-
-  whisper:
-    image: onerahmet/openai-whisper-asr-webservice:latest
-    container_name: whisper
-    networks:
-      - signal-network
-    environment:
-      # tiny/base/small/medium/large-v3 — bigger is more accurate and much
-      # slower on CPU. Downloaded on first request into the cache volume below.
-      ASR_MODEL: ${ASR_MODEL:-base}
-      ASR_ENGINE: ${ASR_ENGINE:-faster_whisper}
-    volumes:
-      - "./whisper_cache:/root/.cache"
-    restart: unless-stopped
-
   signal-api:
     image: bbernhard/signal-cli-rest-api:latest
     container_name: signal-api
@@ -44,15 +16,14 @@ services:
     container_name: email-bridge
     networks:
       - signal-network
-    # Public resolvers as a fallback: the IMAP host is resolved on every poll,
-    # so a flaky host resolver would otherwise stall the bridge.
+    # Public resolvers as a fallback: the IMAP host and the LLM/Whisper
+    # providers are resolved on every call, so a flaky host resolver would
+    # otherwise stall the bridge.
     dns:
       - 8.8.8.8
       - 1.1.1.1
     depends_on:
       - signal-api
-      - ollama
-      - whisper
     # Map form (not the `- KEY=value` list) so the prompts below can be YAML
     # block scalars: their {subject}/{body} placeholders would otherwise be
     # mangled by compose's ${...} interpolation.
@@ -71,17 +42,19 @@ services:
       MAX_CONSECUTIVE_FAILURES: ${MAX_CONSECUTIVE_FAILURES:-10}
       FAILURE_BACKOFF_MAX: ${FAILURE_BACKOFF_MAX:-300}
 
-      # ── LLM (Ollama) ──────────────────────────────────────────────────────
-      # Summaries are on by default for every forwarded email and voice note.
-      # All of the LLM's behaviour is configured here; bridge.py reads it from
-      # the environment and needs no edit to retune.
-      OLLAMA_URL: http://ollama:11434
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:e2b}
-      OLLAMA_TIMEOUT: ${OLLAMA_TIMEOUT:-180}
+      # ── LLM summariser ────────────────────────────────────────────────────
+      # Any OpenAI-compatible chat-completions provider. LLM_URL is the API
+      # base (the part ending in /v1); the bridge appends /chat/completions.
+      # Summaries are on by default for every forwarded email and voice note;
+      # if the provider is unreachable, emails fall back to a body excerpt.
+      # Keys live in .env, never here.
+      LLM_URL: ${LLM_URL:-https://api.openai.com/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-180}
       LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.2}
       # ~160 tokens is comfortably more than the 2 sentences we ask for.
-      LLM_NUM_PREDICT: ${LLM_NUM_PREDICT:-160}
-      LLM_NUM_CTX: ${LLM_NUM_CTX:-4096}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-160}
       LLM_MAX_INPUT_CHARS: ${LLM_MAX_INPUT_CHARS:-4000}
 
       # The sender is never asked of the model — it is parsed deterministically
@@ -96,7 +69,7 @@ services:
 
         Body:
         {body}
-      # Placeholder: {body} (the Whisper transcript).
+      # Placeholder: {body} (the transcript).
       VOICE_SUMMARY_PROMPT: |-
         You summarise voice messages for a notification bot.
         In AT MOST 2 short sentences, state what the speaker says and what they ask for (if anything).
@@ -105,11 +78,14 @@ services:
         Transcript:
         {body}
 
-      # ── Whisper (speech-to-text) ──────────────────────────────────────────
-      WHISPER_URL: http://whisper:9000
-      # Empty = let Whisper auto-detect the spoken language.
+      # ── Speech-to-text ────────────────────────────────────────────────────
+      # Any OpenAI-compatible audio-transcriptions provider. WHISPER_URL is the
+      # API base; the bridge appends /audio/transcriptions.
+      WHISPER_URL: ${WHISPER_URL:-https://api.openai.com/v1}
+      WHISPER_API_KEY: ${WHISPER_API_KEY:-}
+      WHISPER_MODEL: ${WHISPER_MODEL:-whisper-1}
+      # Empty = let the provider auto-detect the spoken language.
       WHISPER_LANG: ${WHISPER_LANG:-}
-      WHISPER_TASK: ${WHISPER_TASK:-transcribe}
       WHISPER_TIMEOUT: ${WHISPER_TIMEOUT:-600}
       VOICE_INCLUDE_TRANSCRIPT: ${VOICE_INCLUDE_TRANSCRIPT:-false}
     volumes:

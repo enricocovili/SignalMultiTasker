@@ -55,18 +55,22 @@ MAX_CONSECUTIVE_FAILURES = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "10"))
 FAILURE_BACKOFF_MAX = int(os.getenv("FAILURE_BACKOFF_MAX", "300"))
 
 # ── LLM configuration ─────────────────────────────────────────────────────────
-# Everything the LLM does is configured from the environment (wired in
-# docker-compose.yaml) — endpoint, model, decoding options, input budget and the
-# two prompts. Nothing here should need a code change to retune.
-LLM_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
-LLM_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:e2b")
-LLM_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "180"))
+# The summariser is any OpenAI-compatible chat-completions endpoint: a hosted
+# provider, a gateway, or a local runtime that serves the /v1 surface. Nothing
+# here is provider-specific — endpoint, key, model, decoding, input budget and
+# the two prompts all come from the environment (wired in docker-compose.yaml).
+#
+# LLM_URL is the API *base* (the part ending in /v1); "/chat/completions" is
+# appended to it.
+LLM_URL = os.getenv("LLM_URL", "").rstrip("/")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "")
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "180"))
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.2"))
-LLM_NUM_PREDICT = int(os.getenv("LLM_NUM_PREDICT", "160"))
-LLM_NUM_CTX = int(os.getenv("LLM_NUM_CTX", "4096"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "160"))
 
 # Hard cap on how much text is handed to the model, so a 2 MB newsletter can't
-# blow past the context window (and stall a CPU-only Ollama for minutes).
+# blow past the context window (or run up a bill on a per-token provider).
 LLM_MAX_INPUT_CHARS = int(os.getenv("LLM_MAX_INPUT_CHARS", "4000"))
 
 # Both prompts may use {subject} and {body}; unknown placeholders render empty.
@@ -92,11 +96,14 @@ VOICE_SUMMARY_PROMPT = os.getenv(
     "Transcript:\n{body}",
 )
 
-# ── Whisper configuration ─────────────────────────────────────────────────────
-WHISPER_URL = os.getenv("WHISPER_URL", "http://whisper:9000")
-# Empty means "let Whisper auto-detect the language".
+# ── Speech-to-text configuration ──────────────────────────────────────────────
+# Likewise an OpenAI-compatible audio-transcriptions endpoint. WHISPER_URL is
+# the API base; "/audio/transcriptions" is appended to it.
+WHISPER_URL = os.getenv("WHISPER_URL", "").rstrip("/")
+WHISPER_API_KEY = os.getenv("WHISPER_API_KEY", "")
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")
+# Empty means "let the provider auto-detect the spoken language".
 WHISPER_LANG = os.getenv("WHISPER_LANG", "")
-WHISPER_TASK = os.getenv("WHISPER_TASK", "transcribe")
 
 # Include the raw transcript alongside the summary in the Signal reply.
 VOICE_INCLUDE_TRANSCRIPT = os.getenv("VOICE_INCLUDE_TRANSCRIPT", "false").lower() in (
@@ -107,6 +114,35 @@ VOICE_INCLUDE_TRANSCRIPT = os.getenv("VOICE_INCLUDE_TRANSCRIPT", "false").lower(
 VOICE_PENDING_MESSAGE = os.getenv(
     "VOICE_PENDING_MESSAGE", "🎧 Transcribing and summarizing voice message..."
 )
+
+
+def bearer(api_key):
+    """Authorization header for a provider key, or {} when none is configured.
+
+    The key stays optional so the bridge can also point at an unauthenticated
+    endpoint on a trusted network.
+    """
+    return {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+
+def check_provider_config():
+    """Warn loudly about unset provider config; never refuse to start.
+
+    Forwarding mail is the job that must not stop: without an LLM the bridge
+    still forwards a body excerpt, and voice notes are simply not handled.
+    """
+    for name, value, effect in (
+        ("LLM_URL", LLM_URL, "emails forward as a plain excerpt"),
+        ("LLM_MODEL", LLM_MODEL, "emails forward as a plain excerpt"),
+        ("WHISPER_URL", WHISPER_URL, "voice messages cannot be transcribed"),
+    ):
+        if not value:
+            print(f"⚠️ {name} is not set — {effect}.")
+    if LLM_URL and not LLM_API_KEY:
+        print("ℹ️ LLM_API_KEY is not set — calling the LLM without authentication.")
+    if WHISPER_URL and not WHISPER_API_KEY:
+        print("ℹ️ WHISPER_API_KEY is not set — calling Whisper without authentication.")
+
 
 # signal-cli serialises access to the account store: a send issued while a
 # receive is running fails with a lock error. One lock around every signal-api
@@ -151,29 +187,32 @@ class _SafeFields(dict):
 def summarize(prompt_template, body, subject=""):
     """Return a short LLM summary of ``body``, or None if the LLM is unusable.
 
-    Callers must handle None: Ollama is a best-effort dependency, a summary is
-    never worth dropping a notification over.
+    Callers must handle None: the provider is a best-effort dependency, and a
+    summary is never worth dropping a notification over.
     """
+    if not (LLM_URL and LLM_MODEL):
+        return None
+
     prompt = prompt_template.format_map(
         _SafeFields(body=(body or "")[:LLM_MAX_INPUT_CHARS], subject=subject or "")
     )
     payload = {
         "model": LLM_MODEL,
         "messages": [{"role": "user", "content": prompt}],
+        "temperature": LLM_TEMPERATURE,
+        "max_tokens": LLM_MAX_TOKENS,
         "stream": False,
-        "options": {
-            "temperature": LLM_TEMPERATURE,
-            "num_predict": LLM_NUM_PREDICT,
-            "num_ctx": LLM_NUM_CTX,
-        },
     }
     try:
         response = requests.post(
-            f"{LLM_URL}/api/chat", json=payload, timeout=LLM_TIMEOUT
+            f"{LLM_URL}/chat/completions",
+            json=payload,
+            headers=bearer(LLM_API_KEY),
+            timeout=LLM_TIMEOUT,
         )
         response.raise_for_status()
-        data = response.json()
-        summary = (data.get("message", {}).get("content") or "").strip()
+        choices = response.json().get("choices") or []
+        summary = (choices[0].get("message", {}).get("content") or "").strip()
         print(f"🧠 LLM summary in {response.elapsed.total_seconds():.1f}s: {summary!r}")
         return summary or None
     except requests.exceptions.Timeout:
@@ -336,24 +375,31 @@ def delete_attachment(att_id):
         print(f"⚠️ Could not delete attachment {att_id}: {e}")
 
 
-# ── Whisper ───────────────────────────────────────────────────────────────────
+# ── Speech-to-text ────────────────────────────────────────────────────────────
 def transcribe_audio(audio_bytes, filename="voice.ogg"):
-    """Upload audio bytes to the Whisper ASR webservice and return the text."""
-    params = {"task": WHISPER_TASK, "output": "json", "encode": "true"}
+    """Upload audio to the transcription provider and return the text, or None."""
+    if not WHISPER_URL:
+        return None
+
+    data = {"model": WHISPER_MODEL, "response_format": "json"}
     if WHISPER_LANG:
-        params["language"] = WHISPER_LANG
-    files = {"audio_file": (filename, audio_bytes)}
+        data["language"] = WHISPER_LANG
+    files = {"file": (filename, audio_bytes)}
     try:
         r = requests.post(
-            f"{WHISPER_URL}/asr", params=params, files=files, timeout=WHISPER_TIMEOUT
+            f"{WHISPER_URL}/audio/transcriptions",
+            data=data,
+            files=files,
+            headers=bearer(WHISPER_API_KEY),
+            timeout=WHISPER_TIMEOUT,
         )
         r.raise_for_status()
         return (r.json().get("text") or "").strip()
     except requests.exceptions.Timeout:
-        print(f"⚠️ Whisper timed out after {WHISPER_TIMEOUT}s")
+        print(f"⚠️ Transcription timed out after {WHISPER_TIMEOUT}s")
         return None
     except Exception as e:
-        print(f"⚠️ Whisper error: {type(e).__name__}: {e}")
+        print(f"⚠️ Transcription error: {type(e).__name__}: {e}")
         return None
 
 
@@ -748,6 +794,7 @@ def listen_for_emails():
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    check_provider_config()
     ensure_signal_account()
     threading.Thread(
         target=listen_for_voice_notes, name="voice-loop", daemon=True
