@@ -8,9 +8,11 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Install system dependencies if needed (none strictly for these libs, but good practice)
+# gcc for building Python deps; ffmpeg to transcode voice notes (Signal sends
+# AAC) into a format the Whisper-compatible endpoint accepts.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
