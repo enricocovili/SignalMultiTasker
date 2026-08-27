@@ -91,8 +91,10 @@ services:
       WHISPER_URL: ${WHISPER_URL:-https://api.openai.com/v1}
       WHISPER_API_KEY: ${WHISPER_API_KEY:-}
       WHISPER_MODEL: ${WHISPER_MODEL:-whisper-1}
-      # Empty = let the provider auto-detect the spoken language.
-      WHISPER_LANG: ${WHISPER_LANG:-}
+      # Empty = let the provider auto-detect the spoken language. Some
+      # providers translate to English on auto-detect instead of
+      # transcribing verbatim, so this defaults to Italian.
+      WHISPER_LANG: ${WHISPER_LANG:-it}
       WHISPER_TIMEOUT: ${WHISPER_TIMEOUT:-600}
       VOICE_INCLUDE_TRANSCRIPT: ${VOICE_INCLUDE_TRANSCRIPT:-false}
     volumes:
