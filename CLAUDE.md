@@ -18,11 +18,8 @@ Two services on the `signal-network` bridge network (`docker-compose.yaml`):
   custom code. Two loops: the email poll loop runs on the main thread, the
   voice-note loop on a daemon thread.
 - **`signal-api`** — `bbernhard/signal-cli-rest-api`. Outbound messages POST to
-  `/v2/send` with `text_mode: styled`; inbound drain via `GET /v1/receive/{number}`;
-  the voice-note placeholder is resolved by re-POSTing to `/v2/send` with
-  `edit_timestamp` set to the placeholder's own timestamp, editing it in place
-  rather than sending a second message. State (linked Signal account) lives in
-  the `signal-cli-config` volume.
+  `/v2/send` with `text_mode: styled`; inbound drain via `GET /v1/receive/{number}`.
+  State (linked Signal account) lives in the `signal-cli-config` volume.
 
 Summarisation and speech-to-text are **external, keyed providers**, not
 containers. Both are assumed to speak the OpenAI-compatible surface, and both
@@ -84,13 +81,10 @@ Transcription then posts multipart `file` + `model` to
 - Both `dataMessage` (someone else's voice note) and `syncMessage.sentMessage`
   (a voice note sent from the owner's own phone) are handled. This bridge is a
   *linked device*, so dropping the sync case would ignore the owner's own notes.
-- The flow is: send "🎧 Transcribing and summarizing voice message…", capture its
-  timestamp, download the attachment, Whisper, LLM, then edit that same
-  message (via `send_signal_message(..., edit_timestamp=pending_ts)`) into the
-  final result — one notification instead of a send-then-delete pair. **On any
-  exception the `except` clause edits the placeholder into an error message
-  before re-raising**, so a transcription or LLM failure can never leave a
-  "transcribing…" hanging forever.
+- The flow is: download the attachment, transcribe, summarise, send one
+  message with the result — no "transcribing…" placeholder. `summarize()`
+  degrading to `None` and `transcribe_audio()` degrading to `None` already
+  cover the failure paths without needing an interim message.
 - Replies go back to the conversation the note came from
   (`conversation_recipient()`), falling back to `SIGNAL_GROUP_ID`. Its raw
   `groupId` from `/v1/receive` must be base64-re-encoded and `group.`-prefixed
