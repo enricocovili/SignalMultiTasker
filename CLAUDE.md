@@ -19,8 +19,10 @@ Two services on the `signal-network` bridge network (`docker-compose.yaml`):
   voice-note loop on a daemon thread.
 - **`signal-api`** — `bbernhard/signal-cli-rest-api`. Outbound messages POST to
   `/v2/send` with `text_mode: styled`; inbound drain via `GET /v1/receive/{number}`;
-  the placeholder retraction uses `DELETE /v1/remote-delete/{number}`. State
-  (linked Signal account) lives in the `signal-cli-config` volume.
+  the voice-note placeholder is resolved by re-POSTing to `/v2/send` with
+  `edit_timestamp` set to the placeholder's own timestamp, editing it in place
+  rather than sending a second message. State (linked Signal account) lives in
+  the `signal-cli-config` volume.
 
 Summarisation and speech-to-text are **external, keyed providers**, not
 containers. Both are assumed to speak the OpenAI-compatible surface, and both
@@ -73,18 +75,27 @@ the single entry point for both.
 
 `listen_for_voice_notes()` drains `/v1/receive` every `SIGNAL_POLL_INTERVAL`
 seconds and handles any attachment whose `contentType` starts with `audio/`.
-Transcription posts multipart `file` + `model` to
+Signal always sends voice notes as AAC, which some Whisper-compatible backends
+reject outright, so `transcode_to_wav()` pipes the audio through `ffmpeg`
+(installed in the `Dockerfile`) to 16kHz mono WAV before it's ever uploaded.
+Transcription then posts multipart `file` + `model` to
 `{WHISPER_URL}/audio/transcriptions` with `WHISPER_API_KEY` as a `Bearer` header.
 
 - Both `dataMessage` (someone else's voice note) and `syncMessage.sentMessage`
   (a voice note sent from the owner's own phone) are handled. This bridge is a
   *linked device*, so dropping the sync case would ignore the owner's own notes.
-- The flow is: send "🎧 Transcribing and summarizing voice message…", capture the
-  send timestamp, download the attachment, Whisper, LLM, send the result, then
-  remote-delete the placeholder. **The delete lives in a `finally`** so a
-  transcription or LLM failure can never leave a "transcribing…" hanging forever.
+- The flow is: send "🎧 Transcribing and summarizing voice message…", capture its
+  timestamp, download the attachment, Whisper, LLM, then edit that same
+  message (via `send_signal_message(..., edit_timestamp=pending_ts)`) into the
+  final result — one notification instead of a send-then-delete pair. **On any
+  exception the `except` clause edits the placeholder into an error message
+  before re-raising**, so a transcription or LLM failure can never leave a
+  "transcribing…" hanging forever.
 - Replies go back to the conversation the note came from
-  (`conversation_recipient()`), falling back to `SIGNAL_GROUP_ID`.
+  (`conversation_recipient()`), falling back to `SIGNAL_GROUP_ID`. Its raw
+  `groupId` from `/v1/receive` must be base64-re-encoded and `group.`-prefixed
+  before being used as a `/v2/send` recipient — `/v1/receive` and `/v2/send`
+  disagree on group-ID encoding.
 
 ### Email tracking (the core design)
 

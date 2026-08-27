@@ -323,11 +323,13 @@ def ensure_signal_account():
 
 
 # ── Signal helpers ────────────────────────────────────────────────────────────
-def send_signal_message(message, recipient=None):
+def send_signal_message(message, recipient=None, edit_timestamp=None):
     """Send a styled message. Returns the send timestamp, or None on failure.
 
-    The timestamp is what identifies the message later — it is the handle needed
-    to remote-delete the "transcribing…" placeholder.
+    Pass edit_timestamp (a prior send's returned timestamp) to edit that
+    message in place instead of posting a new one — used to turn the
+    "transcribing…" placeholder into the final result without a second
+    notification.
     """
     payload = {
         "message": message,
@@ -335,6 +337,8 @@ def send_signal_message(message, recipient=None):
         "recipients": [recipient or SIGNAL_GROUP_ID],
         "text_mode": "styled",
     }
+    if edit_timestamp:
+        payload["edit_timestamp"] = int(edit_timestamp)
     try:
         with SIGNAL_LOCK:
             r = requests.post(SIGNAL_API_URL, json=payload, timeout=SIGNAL_TIMEOUT)
@@ -350,25 +354,6 @@ def send_signal_message(message, recipient=None):
     except Exception as e:
         print(f"⚠️ Signal send error: {e}")
         return None
-
-
-def delete_signal_message(timestamp, recipient=None):
-    """Remote-delete one of our own sent messages (removes it for everyone)."""
-    if not timestamp:
-        return False
-    url = f"{SIGNAL_API_BASE}/v1/remote-delete/{quote(SIGNAL_SENDER, safe='')}"
-    payload = {"recipient": recipient or SIGNAL_GROUP_ID, "timestamp": int(timestamp)}
-    try:
-        with SIGNAL_LOCK:
-            r = requests.delete(url, json=payload, timeout=SIGNAL_TIMEOUT)
-        if r.status_code in (200, 201, 204):
-            print(f"🗑️ Deleted placeholder message {timestamp}.")
-            return True
-        print(f"⚠️ Could not delete message {timestamp}: {r.status_code} {r.text}")
-        return False
-    except Exception as e:
-        print(f"⚠️ Signal delete error: {e}")
-        return False
 
 
 def fetch_signal_envelopes():
@@ -666,14 +651,15 @@ def conversation_recipient(envelope, data):
 
 
 def process_voice_attachment(att, sender, recipient):
-    """Acknowledge, transcribe, summarise, answer — then drop the ack."""
+    """Acknowledge, transcribe, summarise, answer — editing the ack in place."""
     att_id = att.get("id")
     if not att_id:
         return
     print(f"🎤 Voice note from {sender} ({att.get('contentType')}, id={att_id})")
 
     # Tell the chat we're on it: Whisper + the LLM take tens of seconds on CPU
-    # and silence looks like a broken bridge.
+    # and silence looks like a broken bridge. Its timestamp lets every later
+    # reply edit this same message instead of posting a new notification.
     pending_ts = send_signal_message(VOICE_PENDING_MESSAGE, recipient=recipient)
 
     try:
@@ -681,7 +667,9 @@ def process_voice_attachment(att, sender, recipient):
         transcript = transcribe_audio(audio)
         if not transcript:
             send_signal_message(
-                "⚠️ Could not transcribe the voice message.", recipient=recipient
+                "⚠️ Could not transcribe the voice message.",
+                recipient=recipient,
+                edit_timestamp=pending_ts,
             )
             return
 
@@ -696,11 +684,17 @@ def process_voice_attachment(att, sender, recipient):
         else:
             # No summary available — the transcript is better than nothing.
             msg += f"\n\n**Transcript:** {transcript}"
-        send_signal_message(msg, recipient=recipient)
-    finally:
-        # Always retract the placeholder, including on a failure path, so the
+        send_signal_message(msg, recipient=recipient, edit_timestamp=pending_ts)
+    except Exception:
+        # Always resolve the placeholder, including on a failure path, so the
         # chat is never left with a "transcribing…" that never resolves.
-        delete_signal_message(pending_ts, recipient=recipient)
+        send_signal_message(
+            "⚠️ Something went wrong processing the voice message.",
+            recipient=recipient,
+            edit_timestamp=pending_ts,
+        )
+        raise
+    finally:
         delete_attachment(att_id)
 
 
