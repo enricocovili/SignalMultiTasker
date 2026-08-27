@@ -89,8 +89,13 @@ LLM_MAX_INPUT_CHARS = int(os.getenv("LLM_MAX_INPUT_CHARS", "4000"))
 EMAIL_SUMMARY_PROMPT = os.getenv(
     "EMAIL_SUMMARY_PROMPT",
     "You summarise emails for a notification bot.\n"
-    "In AT MOST 2 short sentences, state what the email is about and what it "
-    "asks the reader to do (if anything).\n"
+    "If the email is a login/sign-in verification code, a one-time "
+    "passcode, a \"new sign-in\" alert, or a successful-login notification, "
+    "output ONLY: Login attempt for <Service> — where <Service> is the "
+    "product or company name (e.g. Cloudflare, Anthropic, Google). Do not "
+    "include the code itself.\n"
+    "Otherwise, in AT MOST 2 short sentences, state what the email is about "
+    "and what it asks the reader to do (if anything).\n"
     "Rules: write in the same language as the email; do not mention or guess "
     "the sender; do not greet, introduce yourself or add any preamble; no "
     "bullet points, no markdown, no quotes. Output only the summary.\n\n"
@@ -579,6 +584,13 @@ def process_email(mail, uid):
     # The LLM only ever produces the "what does this mail want" line. If it is
     # down, fall back to a truncated body so the mail is still forwarded.
     summary = summarize(EMAIL_SUMMARY_PROMPT, body, subject=subject)
+
+    # Login codes/OTPs/sign-in alerts get a bare one-liner instead of the full
+    # sender/subject template — no code, no formatting.
+    if summary and summary.strip().startswith("Login attempt for"):
+        send_signal_message(summary.strip())
+        return
+
     if summary:
         label = "Summary"
     else:
