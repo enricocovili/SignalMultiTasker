@@ -107,8 +107,9 @@ EMAIL_SUMMARY_PROMPT = os.getenv(
 VOICE_SUMMARY_PROMPT = os.getenv(
     "VOICE_SUMMARY_PROMPT",
     "You summarise voice messages for a notification bot.\n"
-    "In AT MOST 2 short sentences, state what the speaker says and what they "
-    "ask for (if anything).\n"
+    "The length of the summary should be linear in size with the size of the trascript, "
+    "with about a 1/5 ratio (5 phrases in transcribe = 1 in summary). \n"
+    "State what the speaker says and what they ask for (if anything).\n"
     "Rules: write in the same language as the transcript; do not greet, "
     "introduce yourself or add any preamble; no bullet points, no markdown, no "
     "quotes. Output only the summary.\n\n"
