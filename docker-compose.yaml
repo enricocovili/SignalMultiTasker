@@ -60,8 +60,8 @@ services:
       # Covers the WHOLE completion. A reasoning model spends this on its
       # reasoning tokens first, so a 2-sentence answer still needs headroom:
       # too low and it returns an empty string, not a short summary.
-      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-1024}
-      LLM_MAX_INPUT_CHARS: ${LLM_MAX_INPUT_CHARS:-4000}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-32768}
+      LLM_MAX_INPUT_CHARS: ${LLM_MAX_INPUT_CHARS:-16384}
 
       # The sender is never asked of the model — it is parsed deterministically
       # from the From header — so the prompt only has to yield the intention.
@@ -71,17 +71,38 @@ services:
         If the email is a login/sign-in verification code, a one-time passcode, a "new sign-in" alert, or a successful-login notification, output ONLY: Login attempt for <Service> — where <Service> is the product or company name (e.g. Cloudflare, Anthropic, Google). Do not include the code itself.
         Otherwise, in AT MOST 2 short sentences, state what the email is about and what it asks the reader to do (if anything).
         Rules: write in the same language as the email; do not mention or guess the sender; do not greet, introduce yourself or add any preamble; no bullet points, no markdown, no quotes. Output only the summary.
-
+    
         Subject: {subject}
 
         Body:
         {body}
       # Placeholder: {body} (the transcript).
       VOICE_SUMMARY_PROMPT: |-
-        You summarise voice messages for a notification bot.
-        The length of the summary should be linear in size with the size of the trascript, with about a 1/5 ratio (5 phrases in transcribe = 1 in summary).
-        State what the speaker says and what they ask for (if anything).
-        Rules: write in the same language as the transcript; do not greet, introduce yourself or add any preamble; no bullet points, no markdown, no quotes. Output only the summary.
+        You summarize voice-message transcripts for a notification bot.
+
+        Write a concise but information-complete summary of the transcript.
+
+        Length:
+        The summary should usually be around 20-30% of the transcript length. This is a guideline, not a hard limit. If more space is needed to preserve important information, make the summary longer. Do not omit meaningful details just to make the summary shorter.
+
+        Content:
+        Preserve all important information mentioned by the speaker, including:
+
+        * what happened or what the speaker is explaining;
+        * people, places, dates, times, quantities, reasons, decisions, and relevant context;
+        * requests, questions, tasks, instructions, or actions the speaker wants from the recipient;
+        * important conditions, constraints, alternatives, or uncertainties.
+
+        Combine repetitive or low-value wording, filler, hesitation, and redundant explanations, but do not merge or remove distinct facts.
+
+        The summary should allow someone who did not listen to the voice message to understand the important content and know whether they need to do anything.
+
+        Rules:
+        Write in the same language as the transcript.
+        Use natural, concise sentences.
+        Do not greet, introduce yourself, or add commentary.
+        Do not use bullet points, markdown, headings, or quotes.
+        Output only the summary.
 
         Transcript:
         {body}
