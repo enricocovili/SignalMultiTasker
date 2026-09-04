@@ -346,6 +346,19 @@ def send_signal_message(message, recipient=None):
         return None
 
 
+def notify_error(text, recipient=None):
+    """Log an error and mirror it into the Signal chat, best-effort.
+
+    Reserved for failures that would otherwise be silent — only visible in
+    `docker compose logs`, which nobody watches continuously. That blind spot
+    is exactly what let the bridge stay dead for 11 days (see the network
+    resilience notes in CLAUDE.md). Never call this from send_signal_message's
+    own error path: a failing Signal send must not try to notify itself.
+    """
+    print(text)
+    send_signal_message(f"🚨 {text}", recipient=recipient)
+
+
 def fetch_signal_envelopes():
     """GET /v1/receive/{number} — returns a list of envelopes, consuming them."""
     url = f"{SIGNAL_API_BASE}/v1/receive/{quote(SIGNAL_SENDER, safe='')}"
@@ -709,11 +722,14 @@ def listen_for_voice_notes():
                     try:
                         process_voice_attachment(att, sender, recipient)
                     except Exception as e:
-                        print(f"⚠️ Error processing voice attachment: {e}")
+                        notify_error(
+                            f"⚠️ Error processing voice attachment: {e}",
+                            recipient=recipient,
+                        )
         except requests.exceptions.RequestException as e:
-            print(f"⚠️ Signal receive error: {e}")
+            notify_error(f"⚠️ Signal receive error: {e}")
         except Exception as e:
-            print(f"⚠️ Voice loop error: {type(e).__name__}: {e}")
+            notify_error(f"⚠️ Voice loop error: {type(e).__name__}: {e}")
         time.sleep(SIGNAL_POLL_INTERVAL)
 
 
@@ -798,7 +814,7 @@ def listen_for_emails():
                         try:
                             process_email(mail, str(uid).encode())
                         except Exception as e:
-                            print(f"⚠️ Error processing email UID {uid}: {e}")
+                            notify_error(f"⚠️ Error processing email UID {uid}: {e}")
                     save_state({"uidvalidity": uidvalidity, "last_uid": max_uid})
 
             consecutive_failures = 0
@@ -806,7 +822,7 @@ def listen_for_emails():
             # Transient by nature: DNS resolution failures, refused/reset
             # connections, TLS errors, read timeouts, server-side hiccups.
             consecutive_failures += 1
-            print(
+            notify_error(
                 f"⚠️ Poll failed ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): "
                 f"{type(e).__name__}: {e}"
             )
@@ -815,11 +831,11 @@ def listen_for_emails():
                 # us, which is the only way to recover from a wedged resolver or
                 # a broken network namespace. Flagged rather than exited here so
                 # the `finally` below still closes the IMAP connection.
-                print("💥 Too many consecutive failures — exiting for a restart.")
+                notify_error("💥 Too many consecutive failures — exiting for a restart.")
                 fatal = True
         except Exception as e:
             consecutive_failures += 1
-            print(f"⚠️ Error: {type(e).__name__}: {e}")
+            notify_error(f"⚠️ Error: {type(e).__name__}: {e}")
         finally:
             if mail is not None:
                 close_imap(mail)
