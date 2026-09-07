@@ -3,6 +3,7 @@ import email
 import imaplib
 import json
 import os
+import re
 import socket
 import subprocess
 import threading
@@ -586,6 +587,44 @@ def extract_body(msg):
     return payload.decode("utf-8", errors="ignore") if payload is not None else ""
 
 
+# A reply's body is the new text followed by the whole quoted thread below it.
+# Without cutting that off, summarize() sees the entire conversation and
+# summarises the thread instead of the one new message. Patterns cover the
+# common mail clients/locales; a miss just leaves some quoted text in, a false
+# positive would truncate real content, so these stay conservative.
+_QUOTE_LINE_RE = re.compile(r"^\s*>")
+_ON_WROTE_RE = re.compile(
+    r"^\s*(On|Il|El|Le) .{0,120} (wrote|ha scritto|escribi[oó]|a écrit)\s*:?\s*$",
+    re.IGNORECASE,
+)
+_SEPARATOR_RE = re.compile(
+    r"^\s*(-{2,}\s*Original Message\s*-{2,}|_{8,})\s*$", re.IGNORECASE
+)
+_HEADER_FROM_RE = re.compile(r"^\s*(From|Da|De)\s*:", re.IGNORECASE)
+_HEADER_SENT_RE = re.compile(
+    r"^\s*(Sent|Date|Inviato|Data|Enviado|Envoyé)\s*:", re.IGNORECASE
+)
+
+
+def strip_quoted_reply(body):
+    """Cut ``body`` at the point a reply's quoted history begins."""
+    if not body:
+        return body
+    lines = body.splitlines()
+    for i, line in enumerate(lines):
+        if (
+            _QUOTE_LINE_RE.match(line)
+            or _ON_WROTE_RE.match(line)
+            or _SEPARATOR_RE.match(line)
+        ):
+            return "\n".join(lines[:i]).rstrip()
+        if _HEADER_FROM_RE.match(line) and i + 1 < len(lines) and _HEADER_SENT_RE.match(
+            lines[i + 1]
+        ):
+            return "\n".join(lines[:i]).rstrip()
+    return body.rstrip()
+
+
 def process_email(mail, uid):
     """Fetch one email by UID (without marking it seen) and forward to Signal."""
     # BODY.PEEK avoids setting the \Seen flag — we track state ourselves.
@@ -606,7 +645,9 @@ def process_email(mail, uid):
         send_signal_message(rule["message"])
         return
 
-    body = extract_body(msg)
+    # Strip quoted history first so a one-line reply on a long thread doesn't
+    # get summarised as "the whole conversation" — only the new text remains.
+    body = strip_quoted_reply(extract_body(msg))
     # The LLM only ever produces the "what does this mail want" line. If it is
     # down, fall back to a truncated body so the mail is still forwarded.
     summary = summarize(EMAIL_SUMMARY_PROMPT, body, subject=subject)
