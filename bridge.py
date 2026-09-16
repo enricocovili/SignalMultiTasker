@@ -203,13 +203,19 @@ class _SafeFields(dict):
 
 
 def summarize(prompt_template, body, subject=""):
-    """Return a short LLM summary of ``body``, or None if the LLM is unusable.
+    """Return ``(summary, error)`` for ``body``; ``summary`` is None if unusable.
 
-    Callers must handle None: the provider is a best-effort dependency, and a
-    summary is never worth dropping a notification over.
+    ``error`` is None when the LLM is simply unconfigured (an intentional,
+    silent degrade — see ``check_provider_config``) or when a summary was
+    produced or withheld for content reasons. It is set to a short code only
+    when the provider itself failed (timeout, HTTP error, connection error),
+    so callers can tell "no provider configured" apart from "provider is
+    broken" and react differently. Callers must handle a None summary either
+    way: the provider is a best-effort dependency, and a summary is never
+    worth dropping a notification over.
     """
     if not (LLM_URL and LLM_MODEL):
-        return None
+        return None, None
 
     prompt = prompt_template.format_map(
         _SafeFields(body=(body or "")[:LLM_MAX_INPUT_CHARS], subject=subject or "")
@@ -241,15 +247,19 @@ def summarize(prompt_template, body, subject=""):
                 f"⚠️ LLM returned no content in {took:.1f}s (finish_reason=length) — "
                 f"LLM_MAX_TOKENS={LLM_MAX_TOKENS} is too low for this model."
             )
-            return None
+            return None, None
         print(f"🧠 LLM summary in {took:.1f}s: {summary!r}")
-        return summary or None
+        return summary or None, None
     except requests.exceptions.Timeout:
         print(f"⚠️ LLM timed out after {LLM_TIMEOUT}s")
-        return None
+        return None, "timeout"
+    except requests.exceptions.HTTPError as e:
+        code = e.response.status_code if e.response is not None else "unknown"
+        print(f"⚠️ LLM HTTP error: {code}")
+        return None, str(code)
     except Exception as e:
         print(f"⚠️ LLM error: {type(e).__name__}: {e}")
-        return None
+        return None, type(e).__name__
 
 
 # ── Signal auth ───────────────────────────────────────────────────────────────
@@ -648,9 +658,19 @@ def process_email(mail, uid):
     # Strip quoted history first so a one-line reply on a long thread doesn't
     # get summarised as "the whole conversation" — only the new text remains.
     body = strip_quoted_reply(extract_body(msg))
-    # The LLM only ever produces the "what does this mail want" line. If it is
-    # down, fall back to a truncated body so the mail is still forwarded.
-    summary = summarize(EMAIL_SUMMARY_PROMPT, body, subject=subject)
+    # The LLM only ever produces the "what does this mail want" line. If it's
+    # simply unconfigured, fall back to a truncated body so the mail is still
+    # forwarded; if the provider itself is broken, say so instead — a
+    # truncated excerpt would silently hide a wider outage.
+    summary, llm_error = summarize(EMAIL_SUMMARY_PROMPT, body, subject=subject)
+
+    if llm_error:
+        message = (
+            f"📩 **New Email**\n\n**From:** {sender}\n\n**Subject:** {subject}"
+            f"\n\nError with LLM endpoint {llm_error}"
+        )
+        send_signal_message(message)
+        return
 
     # Login codes/OTPs/sign-in alerts get a bare one-liner instead of the full
     # sender/subject template — no code, no formatting.
@@ -711,7 +731,7 @@ def process_voice_attachment(att, sender, recipient):
             return
 
         print(f"📝 Transcript ({len(transcript)} chars): {transcript[:120]}...")
-        summary = summarize(VOICE_SUMMARY_PROMPT, transcript)
+        summary, _llm_error = summarize(VOICE_SUMMARY_PROMPT, transcript)
 
         msg = f"🎤 **Voice message** from {sender}"
         if summary:
