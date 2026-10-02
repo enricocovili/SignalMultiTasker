@@ -19,8 +19,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the bridge script into the container
-COPY bridge.py ./
+# Copy the bridge package into the container
+COPY bridge/ ./bridge/
 
-# Run the script
-CMD ["python", "bridge.py"]
+# Run the package (bridge/__main__.py)
+CMD ["python", "-m", "bridge"]

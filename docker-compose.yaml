@@ -122,6 +122,7 @@ services:
       # Comma-separated whitelist of chats (group.… IDs / phone numbers) whose
       # voice notes are transcribed. Empty = SIGNAL_GROUP_ID only.
       VOICE_ALLOWED_CHATS: ${VOICE_ALLOWED_CHATS:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - "./bridge_state:/app/state"
     # unless-stopped, not on-failure: on-failure does NOT bring the container

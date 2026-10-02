@@ -7,14 +7,33 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A Signal bridge with two jobs: it polls an IMAP inbox and forwards new emails to
 a Signal group as LLM summaries, and it transcribes voice messages sent to
 Signal and answers with an LLM summary. All application logic lives in
-`bridge.py`; everything else is container orchestration. It runs as a
+the `bridge/` package; everything else is container orchestration. It runs as a
 multi-container `docker compose` stack.
+
+## Code layout
+
+`bridge/` modules, one concern each (import config as `from . import config` and
+read `config.X` at call time, so tests can monkeypatch it):
+
+- `config.py` — every env var; `log.py` — logging setup (`LOG_LEVEL`).
+- `signal_api.py` — all signal-api calls, `SIGNAL_LOCK`, account linking,
+  `notify_error`. `llm.py` — `summarize()`. `stt.py` — transcode + transcribe.
+  `providers.py` — `bearer()`, `check_provider_config()`. `state.py` — email state file.
+- `mailparse.py` (pure header/body parsing), `rules.py` (forwarding rules),
+  `email_loop.py` (`poll_once`, `listen_for_emails`), `voice.py`
+  (`listen_for_voice_notes`, chat whitelist), `main.py` (wiring), `__main__.py`.
+- `tests/` — pytest, covers the pure modules and the LLM client with mocks.
+
+**Logging:** stdlib `logging`, one `logger = logging.getLogger(__name__)` per
+module, `%`-style args, no `print`, no emoji in log messages (emoji belong only in
+Signal messages). `notify_error(text)` logs at ERROR and mirrors to Signal with a
+🚨 prefix, so pass it plain text.
 
 ## Architecture
 
 Two services on the `signal-network` bridge network (`docker-compose.yaml`):
 
-- **`email-bridge`** — built from `Dockerfile`, runs `bridge.py`. The only
+- **`email-bridge`** — built from `Dockerfile`, runs `python -m bridge`. The only
   custom code. Two loops: the email poll loop runs on the main thread, the
   voice-note loop on a daemon thread.
 - **`signal-api`** — `bbernhard/signal-cli-rest-api`. Outbound messages POST to
@@ -54,7 +73,7 @@ the single entry point for both.
   network. Keys live in `.env`, never in `docker-compose.yaml`.
 - **All LLM config lives in `docker-compose.yaml`** — endpoint, key, model,
   timeout, temperature, `max_tokens`, input char cap, and both prompts. The
-  `bridge.py` constants are only fallback defaults; retuning must not need a
+  `bridge/config.py` constants are only fallback defaults; retuning must not need a
   code change. The prompts are YAML block scalars in the map-form `environment:`
   block *on purpose*: in the `- KEY=value` list form, the `{subject}`/`{body}`
   placeholders break compose's `${...}` interpolation.
@@ -134,7 +153,7 @@ The poll loop must never be able to hang or die quietly:
 
 ## Configuration
 
-All config is environment-driven (`os.getenv` in `bridge.py`, wired in
+All config is environment-driven (`os.getenv` in `bridge/config.py`, wired in
 `docker-compose.yaml`). Secrets live in `.env` (gitignored): `EMAIL_USER`,
 `EMAIL_PASS`, `SIGNAL_SENDER`, `SIGNAL_GROUP_ID`, `LLM_API_KEY`,
 `WHISPER_API_KEY`. `.env.example` is the tracked template — add every new
@@ -155,11 +174,11 @@ docker compose logs -f email-bridge
 # Validate compose file
 docker compose config -q
 
-# Syntax-check the bridge (no test suite exists)
-python -m py_compile bridge.py
+# Run the unit tests (pure logic only; no network, no containers)
+pip install -r requirements-dev.txt && pytest
 ```
 
-There is no test suite, linter config, or build step beyond the Docker image.
+There is no linter config or build step beyond the Docker image.
 
 ## Branches
 

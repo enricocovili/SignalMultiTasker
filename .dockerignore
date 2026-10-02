@@ -3,6 +3,11 @@ ollama_data/
 signal-cli-config/
 bridge_state/
 
+# Tests (dev only)
+tests/
+pytest.ini
+requirements-dev.txt
+
 # Local dev / VCS
 .git/
 .gitignore
