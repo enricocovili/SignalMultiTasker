@@ -119,6 +119,9 @@ services:
       WHISPER_LANG: ${WHISPER_LANG:-it}
       WHISPER_TIMEOUT: ${WHISPER_TIMEOUT:-600}
       VOICE_INCLUDE_TRANSCRIPT: ${VOICE_INCLUDE_TRANSCRIPT:-false}
+      # Comma-separated whitelist of chats (group.… IDs / phone numbers) whose
+      # voice notes are transcribed. Empty = SIGNAL_GROUP_ID only.
+      VOICE_ALLOWED_CHATS: ${VOICE_ALLOWED_CHATS:-}
     volumes:
       - "./bridge_state:/app/state"
     # unless-stopped, not on-failure: on-failure does NOT bring the container

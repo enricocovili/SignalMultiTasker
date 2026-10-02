@@ -133,6 +133,16 @@ VOICE_INCLUDE_TRANSCRIPT = os.getenv("VOICE_INCLUDE_TRANSCRIPT", "false").lower(
     "yes",
 )
 
+# Conversations the voice-note pipeline may act on, comma-separated: group IDs in
+# /v2/send form ("group.…", same as SIGNAL_GROUP_ID) and/or phone numbers for 1:1
+# chats. Voice notes anywhere else are ignored. Empty = only SIGNAL_GROUP_ID, so
+# the pipeline is never global.
+VOICE_ALLOWED_CHATS = {
+    c.strip()
+    for c in (os.getenv("VOICE_ALLOWED_CHATS") or SIGNAL_GROUP_ID or "").split(",")
+    if c.strip()
+}
+
 
 def bearer(api_key):
     """Authorization header for a provider key, or {} when none is configured.
@@ -770,6 +780,10 @@ def iter_voice_messages(envelopes):
 
 def listen_for_voice_notes():
     print(f"🎙️  Voice-note listener started for {SIGNAL_SENDER}...")
+    if not VOICE_ALLOWED_CHATS:
+        print("⚠️ VOICE_ALLOWED_CHATS and SIGNAL_GROUP_ID are unset: voice notes will be ignored")
+    else:
+        print(f"🎙️  Voice notes enabled for: {', '.join(sorted(VOICE_ALLOWED_CHATS))}")
     while True:
         try:
             for envelope, data in iter_voice_messages(fetch_signal_envelopes()):
@@ -777,6 +791,10 @@ def listen_for_voice_notes():
                     envelope.get("sourceName") or envelope.get("source") or "unknown"
                 )
                 recipient = conversation_recipient(envelope, data)
+                if recipient not in VOICE_ALLOWED_CHATS:
+                    # Logged so the ID can be copied into VOICE_ALLOWED_CHATS.
+                    print(f"🔇 Ignoring voice note from {sender} in {recipient} (not whitelisted)")
+                    continue
                 for att in data.get("attachments") or []:
                     if not (att.get("contentType") or "").startswith("audio/"):
                         continue

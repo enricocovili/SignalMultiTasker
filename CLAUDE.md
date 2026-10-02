@@ -85,6 +85,10 @@ Transcription then posts multipart `file` + `model` to
   message with the result — no "transcribing…" placeholder. `summarize()`
   degrading to `None` and `transcribe_audio()` degrading to `None` already
   cover the failure paths without needing an interim message.
+- Only whitelisted conversations are processed: `VOICE_ALLOWED_CHATS`
+  (comma-separated `group.…` IDs and/or phone numbers; empty = `SIGNAL_GROUP_ID`
+  only). The check runs on the `conversation_recipient()` result, before any
+  download or provider call; ignored notes are logged with their ID.
 - Replies go back to the conversation the note came from
   (`conversation_recipient()`), falling back to `SIGNAL_GROUP_ID`. Its raw
   `groupId` from `/v1/receive` must be base64-re-encoded and `group.`-prefixed
