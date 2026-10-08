@@ -64,7 +64,7 @@ def process_email(mail, uid):
 
     # Login codes/OTPs/sign-in alerts get a bare one-liner instead of the full
     # sender/subject template — no code, no formatting.
-    if summary and summary.strip().startswith("Login attempt for"):
+    if summary and summary.strip().startswith("Tentativo di accesso a"):
         send_signal_message(summary.strip())
         return
 

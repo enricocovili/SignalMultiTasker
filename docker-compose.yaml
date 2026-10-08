@@ -68,9 +68,9 @@ services:
       # Placeholders: {subject}, {body}.
       EMAIL_SUMMARY_PROMPT: |-
         You summarise emails for a notification bot.
-        If the email is a login/sign-in verification code, a one-time passcode, a "new sign-in" alert, or a successful-login notification, output ONLY: Login attempt for <Service> — where <Service> is the product or company name (e.g. Cloudflare, Anthropic, Google). Do not include the code itself.
+        If the email is a login/sign-in verification code, a one-time passcode, a "new sign-in" alert, or a successful-login notification, output ONLY: Tentativo di accesso a <Service> — where <Service> is the product or company name (e.g. Cloudflare, Anthropic, Google). Do not include the code itself.
         Otherwise, in AT MOST 2 short sentences, state what the email is about and what it asks the reader to do (if anything).
-        Rules: write in the same language as the email; do not mention or guess the sender; do not greet, introduce yourself or add any preamble; no bullet points, no markdown, no quotes. Output only the summary.
+        Rules: ALWAYS write in Italian, whatever the language of the email; do not mention or guess the sender; do not greet, introduce yourself or add any preamble; no bullet points, no markdown, no quotes. Output only the summary.
     
         Subject: {subject}
 
@@ -98,7 +98,7 @@ services:
         The summary should allow someone who did not listen to the voice message to understand the important content and know whether they need to do anything.
 
         Rules:
-        Write in the same language as the transcript.
+        ALWAYS write in Italian, whatever the language of the transcript.
         Use natural, concise sentences.
         Do not greet, introduce yourself, or add commentary.
         Do not use bullet points, markdown, headings, or quotes.
