@@ -108,6 +108,11 @@ Transcription then posts multipart `file` + `model` to
   (comma-separated `group.…` IDs and/or phone numbers; empty = `SIGNAL_GROUP_ID`
   only). The check runs on the `conversation_recipient()` result, before any
   download or provider call; ignored notes are logged with their ID.
+  Setting `VOICE_ALLOWED_CHATS` *replaces* the `SIGNAL_GROUP_ID` fallback, so
+  list that group again if it should stay enabled. It is a whitelist only —
+  there is no blacklist. Currently enabled: the `SIGNAL_GROUP_ID` group plus
+  NEWZ (set in `.env`, not tracked). Group IDs come from
+  `GET /v1/groups/{number}` on signal-api (the `id` field).
 - Replies go back to the conversation the note came from
   (`conversation_recipient()`), falling back to `SIGNAL_GROUP_ID`. Its raw
   `groupId` from `/v1/receive` must be base64-re-encoded and `group.`-prefixed
